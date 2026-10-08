@@ -3195,6 +3195,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightcraft-immich"
+version = "0.4.0"
+dependencies = [
+ "log",
+ "rustls",
+ "rustls-rustcrypto",
+ "serde",
+ "serde_json",
+ "webpki-roots",
+]
+
+[[package]]
 name = "lightcraft-mcp"
 version = "0.4.0"
 dependencies = [
