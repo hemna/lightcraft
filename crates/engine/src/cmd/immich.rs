@@ -125,32 +125,6 @@ fn net(cid: &'static str) -> impl Fn(lightcraft_immich::Error) -> EngineError {
     move |e| EngineError::Other(format!("{cid}: {e}"))
 }
 
-/// Pick the configured server a command names (by name or URL); the lone server answers an
-/// empty selection. Errors list what exists rather than guessing one.
-#[cfg(not(target_arch = "wasm32"))]
-fn client_for(s: &Session, sel: &str, cid: &'static str) -> Result<lightcraft_immich::Client> {
-    use lightcraft_immich::{Client, Limits};
-    let list = &s.immich_servers;
-    if list.is_empty() {
-        return Err(bad(cid, "no Immich server is configured — immich.servers {add: {url, apiKey}}"));
-    }
-    let sel = sel.trim();
-    let picked: Vec<&ImmichServer> = if sel.is_empty() {
-        if list.len() > 1 {
-            let names: Vec<&str> = list.iter().map(|x| x.name.as_str()).collect();
-            return Err(bad(cid, format!("`server` is required — several are configured: {}", names.join(", "))));
-        }
-        vec![&list[0]]
-    } else {
-        list.iter().filter(|x| x.matches(sel)).collect()
-    };
-    let Some(srv) = picked.first() else {
-        let names: Vec<&str> = list.iter().map(|x| x.name.as_str()).collect();
-        return Err(bad(cid, format!("unknown Immich server `{sel}` (configured: {})", names.join(", "))));
-    };
-    Client::new(&srv.url, &srv.api_key, Limits::default()).map_err(net(cid))
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn server_of<'a>(s: &'a Session, p: &Value, cid: &'static str) -> Result<&'a ImmichServer> {
     let sel = str_param(p, "server").unwrap_or("").trim().to_string();
@@ -160,13 +134,10 @@ fn server_of<'a>(s: &'a Session, p: &Value, cid: &'static str) -> Result<&'a Imm
     if sel.is_empty() {
         return s.immich_servers.first().ok_or_else(|| bad(cid, "no server"));
     }
-    s.immich_servers
-        .iter()
-        .find(|x| x.matches(&sel))
-        .ok_or_else(|| {
-            let names: Vec<&str> = s.immich_servers.iter().map(|x| x.name.as_str()).collect();
-            bad(cid, format!("unknown Immich server `{sel}` (configured: {})", names.join(", ")))
-        })
+    s.immich_servers.iter().find(|x| x.matches(&sel)).ok_or_else(|| {
+        let names: Vec<&str> = s.immich_servers.iter().map(|x| x.name.as_str()).collect();
+        bad(cid, format!("unknown Immich server `{sel}` (configured: {})", names.join(", ")))
+    })
 }
 
 /// An ISO-8601-ish date parameter: present, bounded, and free of control characters.
@@ -269,7 +240,8 @@ fn browse(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(not(target_arch = "wasm32"))]
 fn safe_file_name(given: &str, id: &str) -> String {
     let base = given.rsplit(['/', '\\']).next().unwrap_or(given);
-    let mut out: String = base.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c }).collect();
+    let mut out: String =
+        base.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c }).collect();
     let trimmed = out.trim_matches(|c| c == ' ' || c == '.');
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         return format!("immich-{}", &id[..id.len().min(64)]);

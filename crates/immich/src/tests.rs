@@ -333,7 +333,7 @@ fn an_asset_meta_and_a_thumbnail_use_the_asset_endpoints() {
     let got = take(&seen);
     h.join().unwrap();
     assert_eq!((n, sink.len()), (1000, 1000));
-    assert_eq!(got.get(0).unwrap().path, "/api/assets/a1");
+    assert_eq!(got.first().unwrap().path, "/api/assets/a1");
     assert_eq!(got.get(1).unwrap().path, "/api/assets/a%201/thumbnail?size=preview");
 }
 

@@ -169,7 +169,7 @@ fn browse_resolves_the_album_by_name_and_maps_the_page() {
     assert_eq!(r["assets"][0]["fileName"], "IMG_1.JPG", "{r}");
     assert_eq!(r["assets"][0]["rating"], 4, "{r}");
     assert_eq!(r["maybeMore"], true, "a full page means another one may exist");
-    assert_eq!(got.get(0).map(|c| (c.method.as_str(), c.path.as_str())), Some(("GET", "/api/albums")));
+    assert_eq!(got.first().map(|c| (c.method.as_str(), c.path.as_str())), Some(("GET", "/api/albums")));
     let search = got.iter().find(|c| c.path == "/api/search/metadata").expect("a search ran");
     let sent: Value = serde_json::from_slice(&search.body).unwrap();
     assert_eq!(sent["query"]["albumIds"][0], "al1");
@@ -210,7 +210,9 @@ fn import_downloads_then_runs_the_library_import_pipeline() {
         assert!(std::path::Path::new(p).starts_with(&originals) && std::path::Path::new(p).exists(), "{p} outside {originals:?} or missing");
     }
     // …and nothing of the import was left lying around in the library itself
-    let stray = std::fs::read_dir(&lib).map(|rd| rd.filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("jpg"))).count()).unwrap_or(0);
+    let stray = std::fs::read_dir(&lib)
+        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("jpg"))).count())
+        .unwrap_or(0);
     assert_eq!(stray, 0, "no stray downloads in the library folder");
     // one undo step for the whole import, like any other import
     s.execute("edit.undo", &Value::Null).unwrap();
