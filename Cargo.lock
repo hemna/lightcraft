@@ -3359,6 +3359,7 @@ dependencies = [
  "lightcraft-engine",
  "lightcraft-faces",
  "lightcraft-geom",
+ "lightcraft-immich",
  "lightcraft-meta",
  "lightcraft-pipeline",
  "lightcraft-preview",
