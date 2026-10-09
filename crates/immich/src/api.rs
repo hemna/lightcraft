@@ -25,6 +25,8 @@ pub struct Limits {
     pub max_json: u64,
     /// Cap on one downloaded original.
     pub max_download: u64,
+    /// Cap on one downloaded thumbnail (a screen-sized JPEG is far under this).
+    pub max_thumb: u64,
     /// Cap on one uploaded derivative.
     pub max_upload: u64,
 }
@@ -36,6 +38,7 @@ impl Default for Limits {
             stall: Duration::from_secs(30),
             max_json: 8 * 1024 * 1024,
             max_download: 4 * 1024 * 1024 * 1024,
+            max_thumb: 32 * 1024 * 1024,
             max_upload: 256 * 1024 * 1024,
         }
     }
@@ -70,6 +73,8 @@ pub struct Asset {
     pub file_created_at: Option<String>,
     #[serde(alias = "is_favorite")]
     pub is_favorite: bool,
+    /// 1–5 where the owner rated it; the rating filter itself is deprecated server-side since 3.2.
+    pub rating: Option<u32>,
     pub visibility: Option<String>,
     #[serde(alias = "library_id")]
     pub library_id: Option<String>,
@@ -92,8 +97,16 @@ pub struct SearchQuery {
     pub album_ids: Vec<String>,
     pub tag_ids: Vec<String>,
     pub is_favorite: Option<bool>,
+    /// 1–5 (the server deprecates the filter in 3.2 but still honours it).
+    pub rating: Option<u32>,
+    pub checksum: Option<String>,
+    /// ISO 8601 file-creation range, for browsing by date.
+    pub created_after: Option<String>,
+    pub created_before: Option<String>,
     /// ISO 8601, for incremental imports.
     pub updated_after: Option<String>,
+    /// `"IMAGE"` / `"VIDEO"`, as the server spells them.
+    pub asset_type: Option<String>,
     /// 1-based. We page by number rather than by the server's `nextPage` token, whose shape has
     /// moved around across 3.x.
     pub page: u32,
@@ -114,8 +127,23 @@ impl SearchQuery {
         if let Some(f) = self.is_favorite {
             q.insert("isFavorite".into(), serde_json::json!(f));
         }
+        if let Some(r) = self.rating.filter(|r| (1..=5).contains(r)) {
+            q.insert("rating".into(), serde_json::json!(r));
+        }
+        if let Some(c) = &self.checksum {
+            q.insert("checksum".into(), serde_json::json!(c));
+        }
+        if let Some(d) = &self.created_after {
+            q.insert("createdAfter".into(), serde_json::json!(d));
+        }
+        if let Some(d) = &self.created_before {
+            q.insert("createdBefore".into(), serde_json::json!(d));
+        }
         if let Some(d) = &self.updated_after {
             q.insert("updatedAfter".into(), serde_json::json!(d));
+        }
+        if let Some(t) = &self.asset_type {
+            q.insert("type".into(), serde_json::json!(t));
         }
         q.insert("withStacked".into(), serde_json::json!(true));
         q.insert("withExif".into(), serde_json::json!(false));
@@ -298,6 +326,37 @@ impl Client {
                 return Err(Error::Limit(format!("the download passed the {}-byte limit", self.limits.max_download)));
             }
             out.write_all(buf.get(..n).unwrap_or_default()).map_err(|e| Error::Transport(format!("could not write the download: {e}")))?;
+            done = next;
+            progress(done);
+        }
+    }
+
+    /// `GET /assets/{id}` — one asset's record (name, creation date, rating): the cheap way to
+    /// label an asset id that came from a search done earlier or from elsewhere.
+    pub fn asset(&self, id: &str) -> Result<Asset, Error> {
+        self.get_json(&format!("/assets/{}", encode_segment(id)))
+    }
+
+    /// `GET /assets/{id}/thumbnail?size=…` into `out`, capped by `max_thumb`. `size` is one of
+    /// the server's sizes (e.g. `"preview"`); an unknown one is the server's `Api` error, not ours.
+    pub fn thumbnail<W: Write>(&self, id: &str, size: &str, out: &mut W, mut progress: impl FnMut(u64)) -> Result<u64, Error> {
+        let rest = format!("/assets/{}/thumbnail?size={}", encode_segment(id), encode_segment(size));
+        let mut resp = self.send("GET", &rest, None, None)?;
+        if let Some(n) = resp.content_length().filter(|n| *n > self.limits.max_thumb) {
+            return Err(Error::Limit(format!("this thumbnail is {n} bytes, over the {}-byte limit", self.limits.max_thumb)));
+        }
+        let mut done: u64 = 0;
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            let n = resp.read(&mut buf, &self.limits())?;
+            if n == 0 {
+                return Ok(done);
+            }
+            let next = done.saturating_add(n as u64);
+            if next > self.limits.max_thumb {
+                return Err(Error::Limit(format!("the thumbnail passed the {}-byte limit", self.limits.max_thumb)));
+            }
+            out.write_all(buf.get(..n).unwrap_or_default()).map_err(|e| Error::Transport(format!("could not write the thumbnail: {e}")))?;
             done = next;
             progress(done);
         }

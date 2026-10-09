@@ -295,6 +295,59 @@ fn an_unusable_configuration_is_an_error_not_a_panic() {
 }
 
 #[test]
+fn the_extra_filters_travel_in_the_search_body() {
+    let (base, seen, h) = start(vec![json(200, r#"{"assets":[]}"#)]);
+    let client = Client::new(&base, "k", Limits::default()).unwrap();
+    let q = SearchQuery {
+        rating: Some(4),
+        checksum: Some("abcd".into()),
+        created_after: Some("2026-01-01T00:00:00.000Z".into()),
+        created_before: Some("2026-02-01T00:00:00.000Z".into()),
+        asset_type: Some("IMAGE".into()),
+        page_size: 20,
+        ..Default::default()
+    };
+    client.search(&q).unwrap();
+    let got = take(&seen);
+    h.join().unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&got.first().unwrap().body).unwrap();
+    assert_eq!(sent["query"]["rating"], 4);
+    assert_eq!(sent["query"]["checksum"], "abcd");
+    assert_eq!(sent["query"]["createdAfter"], "2026-01-01T00:00:00.000Z");
+    assert_eq!(sent["query"]["createdBefore"], "2026-02-01T00:00:00.000Z");
+    assert_eq!(sent["query"]["type"], "IMAGE");
+}
+
+#[test]
+fn an_asset_meta_and_a_thumbnail_use_the_asset_endpoints() {
+    let (base, seen, h) = start(vec![
+        json(200, r#"{"id":"a1","checksum":"beef","originalFileName":"IMG_2.HEIC","rating":3,"isFavorite":true}"#),
+        Reply { status: 200, content_type: "image/jpeg", body: "j".repeat(1000) },
+    ]);
+    let client = Client::new(&base, "k", Limits::default()).unwrap();
+    let a = client.asset("a1").unwrap();
+    assert_eq!(a.original_file_name, "IMG_2.HEIC");
+    assert_eq!(a.rating, Some(3));
+    let mut sink = Vec::new();
+    let n = client.thumbnail("a 1", "preview", &mut sink, |_| {}).unwrap();
+    let got = take(&seen);
+    h.join().unwrap();
+    assert_eq!((n, sink.len()), (1000, 1000));
+    assert_eq!(got.get(0).unwrap().path, "/api/assets/a1");
+    assert_eq!(got.get(1).unwrap().path, "/api/assets/a%201/thumbnail?size=preview");
+}
+
+#[test]
+fn a_thumbnail_over_the_cap_is_refused() {
+    let (base, _seen, h) = start(vec![Reply { status: 200, content_type: "image/jpeg", body: "j".repeat(5000) }]);
+    let client = Client::new(&base, "k", Limits { max_thumb: 100, ..Limits::default() }).unwrap();
+    let mut sink = Vec::new();
+    let e = client.thumbnail("a1", "preview", &mut sink, |_| {}).unwrap_err();
+    assert!(matches!(e, Error::Limit(_)), "{e:?}");
+    h.join().unwrap();
+}
+
+#[test]
 fn a_real_server_round_trip_when_one_is_configured() {
     let (Ok(url), Ok(key)) = (std::env::var("IMMICH_TEST_URL"), std::env::var("IMMICH_TEST_KEY")) else {
         eprintln!("IMMICH_TEST_URL/IMMICH_TEST_KEY not set: skipping the live round trip");
