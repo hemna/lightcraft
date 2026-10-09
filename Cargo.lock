@@ -3118,6 +3118,7 @@ dependencies = [
  "lightcraft-fetch",
  "lightcraft-geom",
  "lightcraft-gpu",
+ "lightcraft-immich",
  "lightcraft-merge",
  "lightcraft-meta",
  "lightcraft-pipeline",
