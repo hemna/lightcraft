@@ -291,12 +291,28 @@ fn safe_file_name(given: &str, id: &str) -> String {
     out
 }
 
-/// Where downloads wait before the import pipeline takes them: the system temp folder, per
-/// process. Not inside the library — the pipeline never copies a file that already sits inside
-/// the library folder (import.rs treats it as added-in-place), and `copy` is the point here.
+/// One fresh staging folder per import: a per-process sequence plus the clock make the name
+/// unpredictable (a pid alone is guessable), and on Unix the folder is created `0700`, so a
+/// neighbour on the same box cannot list it or plant a file in it before the import pipeline
+/// reads it. It is removed again when the import ends.
+/// Not inside the library — the pipeline never copies a file that already sits inside the
+/// library folder (import.rs treats it as added-in-place), and `copy` is the point here.
 #[cfg(not(target_arch = "wasm32"))]
-fn staging_dir(_s: &Session) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("lightcraft-immich-{}", std::process::id()))
+fn staging_dir() -> Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("lightcraft-immich-{}-{nanos:x}-{:x}", std::process::id(), STAGING_SEQ.fetch_add(1, Ordering::Relaxed)));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir).map_err(|e| EngineError::Other(format!("immich.import: could not create the staging folder: {e}")))?;
+    Ok(dir)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -339,8 +355,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let srv = server_of(s, p, CID)?;
     let c = lightcraft_immich::Client::new(&srv.url, &srv.api_key, Default::default()).map_err(net(CID))?;
-    let staging = staging_dir(s);
-    std::fs::create_dir_all(&staging).map_err(|e| EngineError::Other(format!("{CID}: could not create the staging folder: {e}")))?;
+    let staging = staging_dir()?;
     let mut paths: Vec<String> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
     for id in &ids {

@@ -258,10 +258,48 @@ fn import_downloads_then_runs_the_library_import_pipeline() {
 }
 
 #[test]
+fn import_staging_is_a_fresh_private_folder_per_run() {
+    // `add` keeps the staged files (and their folder) in place, so the folder is inspectable
+    // afterwards: one per import, named beyond the bare pid, and 0700 on Unix.
+    let lib = temp_dir("impstage");
+    let (base, _seen, h) = start(vec![
+        reply_json(200, r#"{"id":"a1","checksum":"c1","originalFileName":"STAGE_ME_42.JPG"}"#),
+        reply_bytes(200, "image/png", png(4)),
+    ]);
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    add_server(&mut s, &base);
+    let r = s.execute("immich.import", &json!({"server": "Home", "ids": ["a1"], "mode": "add"})).unwrap();
+    h.join().unwrap();
+    assert_eq!(r["report"]["imported"].as_array().map(Vec::len), Some(1), "{r}");
+    // the add-mode file sits in this import's own staging folder; find it (a parallel test may
+    // have created other lightcraft-immich- folders in the meantime)
+    let marker = "STAGE_ME_42.JPG";
+    let staging = std::env::temp_dir()
+        .read_dir()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("lightcraft-immich-")))
+        .find(|p| p.join(marker).is_file())
+        .unwrap_or_else(|| panic!("no staging folder holds {marker}"));
+    let name = staging.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.len() > format!("lightcraft-immich-{}", std::process::id()).len(), "the name carries more than the pid: {name}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777, 0o700, "private by creation");
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+#[test]
 fn import_with_a_multibyte_id_and_no_file_name_does_not_panic() {
     // the asset's id is agent-supplied and may be multi-byte text: with an empty file name the
-    // fallback `immich-<id…>` must cut at a char boundary. 80 three-byte chars put the old
-    // byte cut `id[..64]` inside the character at bytes 63..66, which panicked before the fix.
+    // fallback `immich-<id…>` must cut at a char boundary. A 3-byte char at 150 bytes puts the
+    // old byte cut `id[..64]` mid-character, which panicked before the fix.
     let lib = temp_dir("impmb");
     let id = "€".repeat(80);
     let (base, _seen, h) = start(vec![
