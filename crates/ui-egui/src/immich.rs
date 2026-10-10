@@ -1177,7 +1177,9 @@ pub fn settings_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
         register(ui.ctx(), "field:immichSettingsUrl", r.rect);
     });
     row(ui, t, "API key", |ui| {
-        let r = ui.add(egui::TextEdit::singleline(&mut add_key).password(true).desired_width(300.0));
+        // plain text, not a password field: the user is copying a key they just created, and
+        // a masked field invites paste mistakes that only surface as a 401 later
+        let r = ui.add(egui::TextEdit::singleline(&mut add_key).desired_width(300.0));
         register(ui.ctx(), "field:immichSettingsKey", r.rect);
     });
     row(ui, t, "", |ui| {
