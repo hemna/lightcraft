@@ -230,9 +230,12 @@ fn a_search_sends_our_filters_and_reads_camelcase_assets() {
     let page = client.search(&q).unwrap();
     let got = take(&seen);
     let sent: serde_json::Value = serde_json::from_slice(&got.first().unwrap().body).unwrap();
-    assert_eq!(sent["query"]["albumIds"][0], "alb");
-    assert_eq!(sent["query"]["isFavorite"], true);
-    assert_eq!(sent["query"]["page"], 2);
+    // the search DTO is the body itself — a `query` wrapper is silently ignored by the server
+    assert!(sent.get("query").is_none(), "{sent}");
+    assert_eq!(sent["albumIds"][0], "alb");
+    assert_eq!(sent["isFavorite"], true);
+    assert_eq!(sent["page"], 2);
+    assert_eq!(sent["size"], 1);
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items.first().unwrap().original_file_name, "IMG_1.HEIC");
     assert!(page.items.first().unwrap().is_favorite);
@@ -381,11 +384,11 @@ fn the_extra_filters_travel_in_the_search_body() {
     let got = take(&seen);
     h.join().unwrap();
     let sent: serde_json::Value = serde_json::from_slice(&got.first().unwrap().body).unwrap();
-    assert_eq!(sent["query"]["rating"], 4);
-    assert_eq!(sent["query"]["checksum"], "abcd");
-    assert_eq!(sent["query"]["createdAfter"], "2026-01-01T00:00:00.000Z");
-    assert_eq!(sent["query"]["createdBefore"], "2026-02-01T00:00:00.000Z");
-    assert_eq!(sent["query"]["type"], "IMAGE");
+    assert_eq!(sent["rating"], 4);
+    assert_eq!(sent["checksum"], "abcd");
+    assert_eq!(sent["createdAfter"], "2026-01-01T00:00:00.000Z");
+    assert_eq!(sent["createdBefore"], "2026-02-01T00:00:00.000Z");
+    assert_eq!(sent["type"], "IMAGE");
 }
 
 #[test]

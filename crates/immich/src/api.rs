@@ -350,9 +350,11 @@ impl Client {
         self.get_json("/server/version")
     }
 
-    /// `POST /search/metadata`, one page.
+    /// `POST /search/metadata`, one page. The search DTO is the body itself — current servers
+    /// ignore anything nested under a `query` key (they answer, unfiltered, which is worse than
+    /// an error).
     pub fn search(&self, query: &SearchQuery) -> Result<Paged<Asset>, Error> {
-        let body = serde_json::to_vec(&serde_json::json!({ "query": query.body() })).map_err(|e| Error::Api { status: 0, message: e.to_string() })?;
+        let body = serde_json::to_vec(&query.body()).map_err(|e| Error::Api { status: 0, message: e.to_string() })?;
         let mut resp = self.send("POST", "/search/metadata", Some(&body), Some("application/json"))?;
         let page: SearchResponse = self.json(&mut resp)?;
         let (assets, next_page) = page.assets.into_page();

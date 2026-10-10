@@ -150,6 +150,8 @@ impl ImmichDialog {
             is_favorite: self.favorite.then_some(true),
             rating: (self.rating >= 1 && self.rating <= 5).then_some(self.rating),
             created_after: parse_date(&self.from_date),
+            // LightCraft is a photo app: movies belong to the movie editors, not here
+            asset_type: Some("IMAGE".into()),
             page: page.clamp(1, 100_000),
             page_size: PAGE_SIZE.min(1000),
             ..Default::default()
@@ -215,7 +217,8 @@ pub struct ImmichTask {
     searching: bool,
     /// Reload the album list on the next tick (the dialog opened, or the server changed).
     need_albums: bool,
-    thumbs: HashMap<String, egui::TextureHandle>,
+    /// The thumbnails that arrived, by asset id.
+    pub thumbs: HashMap<String, egui::TextureHandle>,
     thumb_failed: HashSet<String>,
     thumb_busy: Arc<AtomicUsize>,
     import: Option<ImportRun>,
@@ -274,7 +277,7 @@ impl ImmichTask {
             self.thumb_busy.fetch_sub(1, Ordering::Relaxed);
             return;
         }
-        let (tx, busy) = (self.tx.clone(), self.thumb_busy.clone());
+        let tx = self.tx.clone();
         let (id, url, key) = (id.to_string(), self.server_url.clone(), self.server_key.clone());
         let spawned = spawn("lc-immich-thumb", ctx, move || {
             let image = lightcraft_engine::guard::catch("immich thumbnail", || {
@@ -286,11 +289,17 @@ impl ImmichTask {
             .flatten()
             .ok();
             let _ = tx.send(Event::Thumb { id, image });
-            busy.fetch_sub(1, Ordering::Relaxed);
+            // the slot is released in [`tick`], when the event is applied — releasing it here
+            // as well would count every thumbnail twice and let the bound drift open
         });
         if spawned.is_err() {
             self.thumb_busy.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Thumbnails asked for but not answered yet (for tests: the bound must hold).
+    pub fn thumbs_in_flight(&self) -> usize {
+        self.thumb_busy.load(Ordering::Relaxed)
     }
 }
 
@@ -1266,6 +1275,7 @@ mod tests {
         assert_eq!(q.is_favorite, Some(true));
         assert_eq!(q.rating, Some(4));
         assert_eq!(q.created_after.as_deref(), Some("2026-02-01"));
+        assert_eq!(q.asset_type.as_deref(), Some("IMAGE"), "movies are not photos");
         assert_eq!((q.page, q.page_size), (3, 60));
         // unchecked filters are simply not sent
         d.favorite = false;

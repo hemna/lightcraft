@@ -205,10 +205,11 @@ fn browse_resolves_the_album_by_name_and_maps_the_page() {
     assert_eq!(got.first().map(|c| (c.method.as_str(), c.path.as_str())), Some(("GET", "/api/albums")));
     let search = got.iter().find(|c| c.path == "/api/search/metadata").expect("a search ran");
     let sent: Value = serde_json::from_slice(&search.body).unwrap();
-    assert_eq!(sent["query"]["albumIds"][0], "al1");
-    assert_eq!(sent["query"]["isFavorite"], true);
-    assert_eq!(sent["query"]["rating"], 4);
-    assert_eq!(sent["query"]["size"], 1);
+    assert!(sent.get("query").is_none(), "the search DTO is the body itself: {sent}");
+    assert_eq!(sent["albumIds"][0], "al1");
+    assert_eq!(sent["isFavorite"], true);
+    assert_eq!(sent["rating"], 4);
+    assert_eq!(sent["size"], 1);
 }
 
 #[test]

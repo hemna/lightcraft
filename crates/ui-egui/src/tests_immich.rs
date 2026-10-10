@@ -149,6 +149,9 @@ fn browse_select_and_import_round_trip_through_the_dialog() {
     // Select the cell, then Import; the whole batch lands in the catalog.
     let r = h.request("ui.clickWidget", json!({"id": "immich:0"}), T);
     assert_eq!(r["ok"], true, "the cell is on screen: {r}");
+    // the thumbnail arrived and released its in-flight slot (the bound must not drift open)
+    let settled = h.step_until(SETTLE, |h| h.app.immich_task.as_ref().is_some_and(|t| !t.thumbs.is_empty() && t.thumbs_in_flight() == 0));
+    assert!(settled, "the thumbnail loaded and the in-flight count returned to zero");
     let r = h.request("ui.clickWidget", json!({"id": "button:immichImport"}), T);
     assert_eq!(r["ok"], true, "Import is enabled with a selection: {r}");
     let done = h.step_until(SETTLE, |h| h.app.session.catalog.len() == 1);
