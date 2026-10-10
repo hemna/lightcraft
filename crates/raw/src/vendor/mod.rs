@@ -1,6 +1,7 @@
 //! Vendor raw formats (TIFF-based) and helpers shared by them.
 
 pub mod arw;
+mod arw_lens;
 pub mod cr2;
 pub mod cr3;
 pub mod crx;
@@ -12,9 +13,30 @@ pub mod pef;
 pub mod raf;
 mod rafc;
 pub mod rw2;
+mod sr2;
+pub mod srw;
 
-use crate::{BlackLevel, Rect};
+use crate::{BlackLevel, Cfa, Rect};
+use lightcraft_tiff::Tiff;
 use std::ops::Range;
+
+/// Exif `CFAPattern`.
+pub(crate) const EXIF_CFA_PATTERN: u16 = 0xa302;
+
+/// The colour-filter layout from the Exif `CFAPattern` tag (`0xa302`: two 16-bit repeat counts, found in either
+/// byte order, then one byte per site: 0 = red, 1 = green, 2 = blue), when it describes a 2×2 Bayer cell.
+pub(crate) fn cfa_from_exif(tiff: &Tiff) -> Option<Cfa> {
+    let &[c0, c1, r0, r1, s0, s1, s2, s3] = tiff.exif()?.bytes(EXIF_CFA_PATTERN)? else { return None };
+    let two = |a: u8, b: u8| matches!((a, b), (2, 0) | (0, 2));
+    let name = match [s0, s1, s2, s3] {
+        [0, 1, 1, 2] => "RGGB",
+        [2, 1, 1, 0] => "BGGR",
+        [1, 0, 2, 1] => "GRBG",
+        [1, 2, 0, 1] => "GBRG",
+        _ => return None,
+    };
+    (two(c0, c1) && two(r0, r1)).then(|| Cfa::bayer_static(name))
+}
 
 /// Black level per 2×2 CFA position (anchored at the active area origin) from masked sensor columns `cols` over
 /// rows `rows`. Falls back to 0 when the region is empty.

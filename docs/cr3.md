@@ -5,6 +5,12 @@ The CR3 adapter reads the CRX Bayer track, `CMP1` compression descriptor,
 black/white levels and the default crop come from the file. A Dual Pixel delta
 track is never substituted for the primary Bayer track.
 
+The in-camera aspect ratio (3:2, 4:3, 16:9, 1:1) is not applied to the sensor data. The maker note's
+`AspectInfo` (tag `0x009a`: aspect code, cropped width, height, left, top) gives the shot's rectangle inside the
+recommended crop, and the decoder uses it as the default crop, so the developed image has the shape the photographer
+framed (PowerShot SX70 HS, EOS 250D, PowerShot G5 X Mark II, EOS M6 Mark II and EOS M50 samples). A rectangle that
+is missing or does not fit inside the crop is ignored. The embedded JPEG still shows the whole frame.
+
 The decoder is independent Rust code shared by desktop, CLI and WebAssembly;
 it has no operating-system imaging dependency or external decoder. Its sources
 are the public prose descriptions and patents cited in
@@ -55,7 +61,16 @@ The version `0x200` QP predictor and entropy framing were checked independently.
 Controlled input mutations establish floor averaging of paired QP rows before
 the nonlinear integer table, then multiplication, division by eight, addition
 of the subband base and a minimum step of one. QP values 131–167 are verified;
-unmeasured values and an odd QP-map height are rejected. Partial-subband and
+unmeasured values are rejected.
+
+An odd QP-map height (EOS R7: 4732 sensor rows give 1183 QP rows) leaves the
+last row of the second-level high-frequency bands without a partner row; that
+row's QP is used on its own. The odd-height map decodes to the exact end of its
+entropy stream. This rule is not yet checked against a black-box reference:
+it was checked on paired R7 RAW and C-RAW captures of the same scene (ISO 100
+and 6400), whose developed images match visually and whose sensor means agree
+within 0.1% at ISO 6400. Files with even-height maps never reach this rule, so
+the six verified fixtures are unchanged. Partial-subband and
 rounded-plane coding, vertical C-RAW tiling and adaptive low-frequency gains
 remain unsupported. The decoder bounds image dimensions, sample count,
 tile count, marker headers and temporary allocations. The full sensor buffer is

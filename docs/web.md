@@ -52,13 +52,14 @@ codecs) at opt-level 3 and the rest (egui, eframe, serde, glue) at "s". What goe
 is the brotli column: 3.1 MB, 11 % less than the old build's brotli size and 41 % less than its
 gzip size (5.25 MB). `wasm-opt -Oz`, when installed, shrinks it further.
 
-**Fonts.** The browser has no system fonts to fall back on, so Japanese text comes from
+**Fonts.** The browser has no system fonts to fall back on, so CJK text comes from
 [craft-fonts](https://github.com/storytold/craft-fonts), the optional `CRAFT_FONTS_DIR` build
 input (`CRAFT_FONTS_DIR=../craft-fonts cargo xtask web`; release builds always set it). On wasm32
-`crates/engine/build.rs` embeds only BIZ UDPGothic Regular (UI, and the watermark fallback), so
-the module stays well under Cloudflare's 25 MiB per-file limit: measured 2026-10-06, 17.1 MB
-without craft-fonts and 21.8 MB with it (brotli 3.8 MB / 6.3 MB). Without it the web build
-works, but Japanese text has no glyphs.
+`crates/engine/build.rs` embeds only BIZ UDPGothic Regular (UI and watermark fallback). The web
+bundle also ships Noto Sans CJK SC Regular as `lightcraft_zh_hans.otf` and loads it before the UI
+starts. Keeping the 16 MB Chinese face separate leaves the module under Cloudflare's 25 MiB
+per-file limit (the older Japanese-only module measured 21.8 MB). Without `CRAFT_FONTS_DIR`, the
+web build still works, but Chinese and Japanese text lack glyphs.
 
 ## Deploying: headers
 
@@ -111,9 +112,10 @@ are the same in every version, so serve them with `Cache-Control: no-cache` (not
     (`originals/<hash>/<file name>`, so an unzipped backup is browsable; entries are stored, not
     compressed; at most 4 GB). **File ▸ Restore Library from Backup…** reads such a zip into a
     new library folder (`library-restored-<time>/`; originals already stored are skipped, every
-    entry's checksum is verified) and only then switches to it (`active-library` names the
-    folder in use) and reloads: the previous library stays in storage. Both are web-only
-    (`file.backupLibrary`, `file.restoreLibrary`; the desktop library is a folder).
+    entry's checksum is verified, and each restored original must match its content hash) and
+    only then switches to it (`active-library` names the folder in use) and reloads: the previous
+    library stays in storage. Both are web-only (`file.backupLibrary`, `file.restoreLibrary`; the
+    desktop library is a folder).
   - A failed save (quota exceeded, storage cleared) is not silent: the catalog then refuses new
     writes, so commands report `saved in memory but not written`, the top bar shows the unsaved
     warning (as on the desktop, see `docs/control-protocol.md`), and saving is retried every
@@ -122,8 +124,8 @@ are the same in every version, so serve them with `Cache-Control: no-cache` (not
     a reload); a notice says why.
   - One tab at a time: the page holds a Web Lock (`navigator.locks`, `lightcraft-library`); a
     second tab or window shows "LightCraft is already open in another tab" instead of loading
-    its own copy (two copies would overwrite each other's saves). Browsers without Web Locks
-    aren't protected.
+    its own copy (two copies would overwrite each other's saves). Browsers without Web Locks, or
+    that refuse the lock request, aren't protected: the app starts without the guard.
   - If the stored library can't be opened, a notice says the session is temporary and nothing
     is saved; the stored library is left as it was.
   - A panic (wasm is built with `panic = "abort"`) replaces the page with a message saying the

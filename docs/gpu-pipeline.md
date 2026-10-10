@@ -44,10 +44,32 @@ Overrides (read once at launch):
   the compute device always used Vulkan + DX12 (+ Metal).
 - `LIGHTCRAFT_GPU=0`: GPU rendering off for the process (the window is unaffected).
 
+**DX12 shader compiler (issue #471).** Every instance (window and compute) compiles DX12 shaders with
+FXC (`d3dcompiler_47.dll`, part of Windows; `lightcraft_gpu::backend::backend_options`). wgpu's
+default, `Auto`, loads whichever `dxcompiler.dll` the DLL search path finds first. LightCraft ships
+none, so that copy belongs to another program (a Windows SDK, a folder on `PATH`). An older copy without
+`dxil.dll` beside it (e.g. DXC 1.7) warns that the DXIL is unsigned, wgpu treats the warning as a
+compile error, its indirect-validation pipelines fail, the device is lost, and the window never opened
+(`WGPU error: Parent device is lost`). `WGPU_DX12_COMPILER=dxc | auto | fxc` (wgpu's variable) still
+chooses; with `dxc`, put `dxcompiler.dll` *and* `dxil.dll` (DXC ≥ 1.8.2502) next to `lightcraft.exe`.
+FXC builds the compute kernels somewhat slower than DXC (≈ 9 s vs 7.5 s for the GPU test suite on an
+RTX 4080), off the startup path.
+
 **Off the startup path.** The compute device is created on a background thread once the window is
 up (`gpu::warm_up` from the first frame's settings), and never while GPU rendering is off: with
 Settings ▸ Performance ▸ *Use the GPU for rendering* unchecked (applied before the window opens),
 `LIGHTCRAFT_GPU=0` or `LIGHTCRAFT_GPU_BACKEND=off`, no GPU driver is loaded for rendering at all.
+
+**Quitting.** The devices are never dropped, and renders run on worker threads: a render still inside
+the driver while the process exits crashes there (a SIGSEGV in the NVIDIA Vulkan driver on Linux,
+issue #620), which no panic hook catches. So every entry into a device counts as work in flight
+(`crates/gpu/src/exit.rs`), and the desktop app ends with `LightcraftApp::shutdown` (from `on_exit`,
+after settings and library are saved): `gpu::begin_shutdown()` — from then on `gpu::render` returns
+`None`, no device is created, denoise tiles fail over and a render job gives up instead of rendering
+on the CPU — then the render pool stops (queued jobs dropped, running ones waited for) and
+`gpu::wait_idle` waits for GPU work on other threads (export, denoise, the device warm-up). One
+deadline of 2 s covers it all; past it the app quits anyway. A job pool that is dropped (headless
+hosts, tests) waits for its running jobs the same way (`JobPool::shutdown`, `crates/preview/src/pool.rs`).
 
 **Crash sentinel.** The desktop app writes `gpu-init.marker` into its settings folder (next to
 `ui.json`: `%APPDATA%\LightCraft`, `~/Library/Application Support/LightCraft`,

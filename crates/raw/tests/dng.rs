@@ -669,6 +669,26 @@ fn malformed_jpeg_xl_tiles_are_errors() {
     assert!(matches!(lightcraft_raw::probe_info(&one(good, 3)), Err(RawError::Corrupt(_))));
 }
 
+/// One undecodable tile makes the whole image an error: it is never returned with a black tile.
+#[test]
+fn a_jpeg_xl_tile_that_fails_is_an_error_for_the_image() {
+    use lightcraft_raw::RawError;
+    let (w, h) = (32, 16);
+    let px = pattern(w, h, 1, 12);
+    let tile = |x0: usize| -> Vec<u16> { (0..16).flat_map(|y| px[y * w + x0..y * w + x0 + 16].to_vec()).collect() };
+    let two = |second: Vec<u8>| {
+        let mut raw = base_ifd(w, h, 12, 1, true);
+        raw.set(t::COMPRESSION, Value::Short(vec![compression::JPEG_XL]));
+        raw.set_image(ImageData::Tiles { tile_width: 16, tile_height: 16, tiles: vec![jxl_encode(&tile(0), 16, 16, 1, false), second] });
+        dng(raw, ByteOrder::Little)
+    };
+    assert_eq!(decode(&two(jxl_encode(&tile(16), 16, 16, 1, false))).unwrap().data, RawData::U16(px.clone()));
+    // the second tile is cut short; the first one alone is not an image
+    let good = jxl_encode(&tile(16), 16, 16, 1, false);
+    assert!(matches!(decode(&two(good[..good.len() / 2].to_vec())), Err(RawError::Corrupt(_))));
+    assert!(matches!(decode(&two(vec![0xff, 0x0a, 1, 2, 3])), Err(RawError::Corrupt(_))));
+}
+
 /// The decoder's memory is bounded by the tile: a grey tile that also codes an alpha channel needs
 /// about twice what one plane may use, and is an error rather than an allocation the header asks
 /// for. The same samples without the alpha channel decode.

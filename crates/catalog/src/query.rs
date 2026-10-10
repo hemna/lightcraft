@@ -141,7 +141,7 @@ fn token_matches(p: &Photo, tok: &str) -> bool {
             "person" | "who" => has_person(p, val),
             "type" | "kind" => format!("{:?}", p.kind).eq_ignore_ascii_case(val),
             "edited" => (val == "true" || val == "yes") == p.is_edited(),
-            "date" => p.date().starts_with(val),
+            "date" => p.captured.as_deref().is_some_and(|c| c.starts_with(val)),
             "copy" | "virtual" => (val == "true" || val == "yes") == p.copy_of.is_some(),
             "name" | "file" => p.file_name.to_lowercase().contains(val),
             _ => false,
@@ -154,12 +154,21 @@ fn token_matches(p: &Photo, tok: &str) -> bool {
 /// Whether `p` has a named face region called `name` (case-insensitive).
 fn has_person(p: &Photo, name: &str) -> bool {
     let name = name.trim().to_lowercase();
-    p.meta.regions.iter().any(|r| r.kind == lightcraft_meta::RegionKind::Face && r.name.as_deref().is_some_and(|n| n.to_lowercase() == name))
+    p.people().iter().any(|n| n.to_lowercase() == name)
 }
 
 impl Filter {
     /// Human-readable summary of the active rules (smart album tooltips, `album.list`).
     pub fn describe(&self) -> String {
+        self.describe_in(None)
+    }
+
+    /// [`Filter::describe`] naming the albums its rules test (`RuleSet::describe_with`).
+    pub fn describe_with(&self, cat: &crate::Catalog) -> String {
+        self.describe_in(Some(cat))
+    }
+
+    fn describe_in(&self, cat: Option<&crate::Catalog>) -> String {
         let mut v: Vec<String> = Vec::new();
         if self.rating > 0 {
             let op = match self.rating_op {
@@ -207,9 +216,16 @@ impl Filter {
             v.push(format!("“{}”", self.text.trim()));
         }
         if let Some(rs) = self.rule_set.as_ref().filter(|r| !r.rules.is_empty()) {
-            v.push(rs.describe());
+            v.push(cat.map_or_else(|| rs.describe(), |c| rs.describe_with(c)));
         }
         if v.is_empty() { "all photos".into() } else { v.join(", ") }
+    }
+
+    /// The albums this filter tests: its album field and its rules' Album rules.
+    pub fn albums_tested(&self) -> Vec<crate::AlbumId> {
+        let mut out: Vec<crate::AlbumId> = self.album.into_iter().collect();
+        out.extend(self.rule_set.as_ref().map(crate::RuleSet::albums_tested).unwrap_or_default());
+        out
     }
 
     /// Whether matches depend on the clock (only "in the last…" rules do).
@@ -284,12 +300,18 @@ impl Filter {
             return false;
         }
         if let Some(from) = &self.date_from
-            && p.date() < from.as_str()
+            && match p.captured.as_deref() {
+                Some(c) => c < from.as_str(),
+                None => true,
+            }
         {
             return false;
         }
         if let Some(to) = &self.date_to
-            && p.date().get(..to.len()).unwrap_or(p.date()) > to.as_str()
+            && match p.captured.as_deref() {
+                Some(c) => c.get(..to.len()).unwrap_or(c) > to.as_str(),
+                None => true,
+            }
         {
             return false;
         }
@@ -299,7 +321,7 @@ impl Filter {
             return false;
         }
         if let Some(d) = &self.date
-            && !p.date().starts_with(d.as_str())
+            && !p.captured.as_deref().is_some_and(|c| c.starts_with(d.as_str()))
         {
             return false;
         }
@@ -344,7 +366,7 @@ impl Catalog {
         let mut v: Vec<&Photo> = self.photos().map(|p| p.as_ref()).filter(|p| filter.matches_in(p, self, root.as_deref())).collect();
         v.sort_by(|a, b| {
             let o = match sort.key {
-                SortKey::CaptureDate => a.date().cmp(b.date()),
+                SortKey::CaptureDate => a.captured.cmp(&b.captured).then_with(|| a.imported.cmp(&b.imported)),
                 SortKey::ImportDate => a.imported.cmp(&b.imported),
                 SortKey::EditDate => a.edited.cmp(&b.edited),
                 SortKey::FileName => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
@@ -363,7 +385,7 @@ impl Catalog {
         use std::collections::BTreeMap;
         let mut years: BTreeMap<&str, (BTreeMap<&str, usize>, BTreeMap<&str, usize>)> = BTreeMap::new();
         for p in self.photos().filter(|p| p.in_library()) {
-            let d = p.date();
+            let Some(d) = p.captured.as_deref() else { continue };
             if d.len() >= 10 {
                 let (months, days) = years.entry(&d[..4]).or_default();
                 *months.entry(&d[..7]).or_default() += 1;

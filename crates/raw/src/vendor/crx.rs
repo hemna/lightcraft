@@ -9,7 +9,8 @@
 //! CC0 raw.pixls.us files against an external decoder used only as a black-box oracle.
 //!
 //! Current support: version 0x100 lossless Bayer RAW and horizontal-tile C-RAW,
-//! plus version 0x200 single-tile 14-bit C-RAW with adaptive QP quantization.
+//! plus version 0x200 single-tile 14-bit C-RAW with adaptive QP quantization
+//! (including odd-height QP maps, as on the EOS R7).
 //! Both ff01/ff02/ff03 and ff11/ff12/ff13 marker families are supported.
 //! Six full M50/R100/R8 sensor fixtures match an external decoder sample for sample.
 //! Unverified coding variants return explicit unsupported errors.
@@ -172,9 +173,6 @@ fn supports(config: &Cr3Compression) -> Result<()> {
     }
     if config.version == 0x200 && (config.levels != 3 || config.bit_depth != 14 || config.tile_width != config.width) {
         return Err(RawError::Unsupported("Canon CRX version 0x200 requires a single-tile 14-bit Bayer C-RAW image".into()));
-    }
-    if config.version == 0x200 && !config.height.div_ceil(4).is_multiple_of(2) {
-        return Err(RawError::Unsupported("Canon CRX adaptive QP map with an odd height".into()));
     }
     if config.median_bit_depth.is_some() {
         return Err(RawError::Unsupported("Canon CRX extended median-bit-depth header".into()));
@@ -418,7 +416,9 @@ fn adaptive_step(map: &QpMap, band: usize, x: usize, y: usize, base: u32, gain: 
         let index = row.checked_mul(map.width).and_then(|n| n.checked_add(column)).ok_or(RawError::Limit("CRX QP map index"))?;
         let first = *map.data.get(index).ok_or_else(|| corrupt("QP coordinate outside map"))?;
         let value = if band < 7 {
-            let second_row = row + 1;
+            // An odd-height map (R7: 4732 rows give 1183 QP rows) leaves the
+            // last row of the coarser bands without a partner; it is used alone.
+            let second_row = (row + 1).min(map.height - 1);
             let second = *map.data.get(second_row * map.width + column).ok_or_else(|| corrupt("QP average outside map"))?;
             (first + second) / 2
         } else {
@@ -734,9 +734,6 @@ fn high_frequency_band(src: &[u8], width: usize, height: usize) -> Result<Vec<i3
 }
 
 fn qp_map(src: &[u8], width: usize, height: usize) -> Result<QpMap> {
-    if !height.is_multiple_of(2) {
-        return Err(RawError::Unsupported("Canon CRX adaptive QP map with an odd height".into()));
-    }
     let count = width.checked_mul(height).filter(|&n| width > 0 && n > 0 && n <= MAX_CRX_SAMPLES / 32).ok_or(RawError::Limit("CRX QP map size"))?;
     let mut data = Vec::new();
     data.try_reserve_exact(count).map_err(|_| RawError::Limit("CRX QP allocation"))?;
@@ -1004,6 +1001,17 @@ mod tests {
         assert_eq!(adaptive_step(&low, 4, 0, 0, 0, 1).unwrap(), 1);
         assert_eq!(adaptive_step(&low, 0, 0, 0, 0, 0).unwrap(), 1);
         assert!(matches!(qp_map(&[0, 0, 1, 4, 0x94], 1, 4), Err(RawError::Unsupported(_))));
+    }
+
+    #[test]
+    fn odd_height_qp_map_uses_its_last_row_alone() {
+        // EOS R7 C-RAW: 4732 sensor rows give a 1183-row QP map, so the last
+        // row of the coarser high-frequency bands has no partner row.
+        let map = QpMap { width: 1, height: 3, data: vec![150, 153, 151] };
+        assert_eq!(adaptive_step(&map, 4, 0, 0, 0, 4).unwrap(), 7);
+        // Row 2 alone is QP 151; averaging with a missing row would leave the table.
+        assert_eq!(adaptive_step(&map, 4, 0, 1, 0, 4).unwrap(), adaptive_step(&map, 7, 0, 2, 0, 4).unwrap());
+        assert!(adaptive_step(&map, 4, 0, 2, 0, 4).is_err());
     }
 
     #[test]

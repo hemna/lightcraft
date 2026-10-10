@@ -108,6 +108,10 @@ pub fn read_image(data: &[u8], info: &ImageInfo, order: ByteOrder, packing: Pack
         let (c, px) = match r {
             Ok(v) => v,
             Err(e) => {
+                // a JPEG XL tile that cannot be decoded is not a partial image: the file stays preview-only
+                if info.compression == comp::JPEG_XL {
+                    return Err(e);
+                }
                 first_err.get_or_insert(e);
                 continue;
             }
