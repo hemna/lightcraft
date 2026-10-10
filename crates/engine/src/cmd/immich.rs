@@ -3,8 +3,10 @@
 //!
 //! The servers are the whole configuration — URL, display name, and the API key the user created
 //! in Immich. Nothing here knows any particular instance: no default host, no fallback, no
-//! admin assumptions. Keys live in prefs.json (unencrypted in v1, the file itself 0600; the
-//! OS-keychain follow-up is tracked with the design spec).
+//! admin assumptions. Keys live in the user's per-user settings file
+//! (`config_dir()/immich.json`, created `0600` on Unix), **never in the library**: the library
+//! folder is what people back up and sync, and a key must not travel with it. The file holds the
+//! keys unencrypted in v1; the OS-keychain follow-up is tracked with the design spec.
 //!
 //! Network calls happen on whatever thread runs the command — native only, like
 //! `lightcraft-fetch`. On wasm this module ships the settings commands only; the UI's Immich
@@ -29,7 +31,7 @@ pub struct ImmichServer {
     pub verified: bool,
 }
 
-/// The Immich part of prefs.json.
+/// The Immich part of the user's per-user settings (the config folder), not of a library.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImmichPrefs {
@@ -37,6 +39,81 @@ pub struct ImmichPrefs {
 }
 
 const MAX_SERVERS: usize = 32;
+
+/// Where the user's Immich settings (the servers and their API keys) are kept: the per-user
+/// config folder, never inside a library. A session may override the path (`immich_store`) for
+/// tests, so they never read or write the real file.
+fn store_path(s: &Session) -> Option<std::path::PathBuf> {
+    s.immich_store.clone().or_else(|| crate::config::config_dir().map(|d| d.join("immich.json")))
+}
+
+/// The configured servers. A missing file is an empty list; an unreadable or corrupt one is
+/// reported and starts empty — the next save replaces it, and no command panics on it.
+pub fn load(s: &Session) -> Vec<ImmichServer> {
+    let Some(p) = store_path(s) else {
+        return Vec::new();
+    };
+    match std::fs::read_to_string(&p) {
+        Ok(text) => match serde_json::from_str::<ImmichPrefs>(&text) {
+            Ok(v) => v.servers,
+            Err(e) => {
+                log::warn!("immich: the settings file {} could not be read ({e}); starting empty", p.display());
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Persist the configured servers. On Unix the file is created `0600` at birth — the temp file
+/// and the renamed result alike — so a key never exists in a mode the owner did not choose.
+pub fn save(s: &Session) -> Result<()> {
+    let p = store_path(s).ok_or_else(|| EngineError::Other("immich: no per-user settings folder is available on this platform".to_string()))?;
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| EngineError::Other(format!("immich: could not create the settings folder: {e}")))?;
+    }
+    let v = serde_json::to_vec_pretty(&ImmichPrefs { servers: s.immich_servers.clone() })
+        .map_err(|e| EngineError::Other(format!("immich: could not encode the settings: {e}")))?;
+    write_private(&p, &v)
+}
+
+/// Write `data` to `path` atomically (temp file in the same folder, then rename), with the file
+/// born owner-only on Unix. The temp name is unique per call, so a crashed writer's leftover
+/// cannot make the next save fail.
+fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "immich.json".to_string());
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let tmp = path.with_file_name(format!(".{name}.{}-{nanos:x}-{:x}.tmp", std::process::id(), STORE_SEQ.fetch_add(1, Ordering::Relaxed)));
+    let mut f = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+        }
+    }
+    .map_err(|e| EngineError::Other(format!("immich: could not create the settings file: {e}")))?;
+    if let Err(e) = f.write_all(data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EngineError::Other(format!("immich: could not write the settings file: {e}")));
+    }
+    if let Err(e) = f.sync_all() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EngineError::Other(format!("immich: could not sync the settings file: {e}")));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(EngineError::Other(format!("immich: could not save the settings file: {e}")));
+    }
+    Ok(())
+}
 
 fn valid_url(url: &str) -> bool {
     url.len() <= 2000
@@ -107,7 +184,7 @@ fn servers(s: &mut Session, p: &Value) -> Result<Value> {
                 s.immich_servers.push(entry);
             }
         }
-        s.save_prefs()?;
+        s.save_immich()?;
     }
     if let Some(rm) = p.get("remove") {
         let sel = [str_param(rm, "name"), str_param(rm, "url")].into_iter().flatten().next().unwrap_or_default().to_string();
@@ -119,7 +196,7 @@ fn servers(s: &mut Session, p: &Value) -> Result<Value> {
         if s.immich_servers.len() == before {
             return Err(bad(CID, format!("no Immich server `{sel}`")));
         }
-        s.save_prefs()?;
+        s.save_immich()?;
     }
     Ok(current(s))
 }
@@ -176,7 +253,7 @@ fn test(s: &mut Session, p: &Value) -> Result<Value> {
     let pong = c.ping().map_err(net(CID))?;
     let version = c.version().map_err(net(CID))?;
     mark_verified(s, &url);
-    s.save_prefs()?;
+    s.save_immich()?;
     Ok(json!({ "ok": true, "pong": pong, "version": version.to_string() }))
 }
 
@@ -194,7 +271,7 @@ fn verify(s: &mut Session, p: &Value) -> Result<Value> {
         bad(CID, format!("unknown Immich server `{sel}` (configured: {})", names.join(", ")))
     })?;
     mark_verified(s, &url);
-    s.save_prefs()?;
+    s.save_immich()?;
     Ok(current(s))
 }
 
@@ -303,7 +380,8 @@ fn staging_dir() -> Result<std::path::PathBuf> {
     use std::time::{SystemTime, UNIX_EPOCH};
     static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("lightcraft-immich-{}-{nanos:x}-{:x}", std::process::id(), STAGING_SEQ.fetch_add(1, Ordering::Relaxed)));
+    let dir =
+        std::env::temp_dir().join(format!("lightcraft-immich-{}-{nanos:x}-{:x}", std::process::id(), STAGING_SEQ.fetch_add(1, Ordering::Relaxed)));
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(false);
     #[cfg(unix)]
@@ -406,7 +484,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Immich Servers",
             [],
             None,
-            "{add?: {url, apiKey, name?}, remove?: {name|url}} — the self-hosted Immich servers this library talks to; keys live in prefs.json unencrypted (the file is 0600) and are never echoed. A new or re-added server starts unverified → {servers: [{name, url, insecure, key, verified}]}",
+            "{add?: {url, apiKey, name?}, remove?: {name|url}} — the self-hosted Immich servers this user talks to; keys live in the per-user settings file (config folder, 0600) — never in a library — unencrypted, and are never echoed. A new or re-added server starts unverified → {servers: [{name, url, insecure, key, verified}]}",
             always,
             servers
         ),

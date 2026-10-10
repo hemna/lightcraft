@@ -129,17 +129,23 @@ fn add_server(s: &mut Session, base: &str) {
 fn servers_are_configured_without_ever_echoing_the_key() {
     let lib = temp_dir("srv");
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
     s.open_library(&lib, false).unwrap();
     let r = s.execute("immich.servers", &json!({"add": {"url": "http://127.0.0.1:9", "apiKey": "s3cr3t", "name": "Home"}})).unwrap();
     assert_eq!(r["servers"][0]["name"], "Home", "{r}");
     assert_eq!(r["servers"][0]["insecure"], true, "http shows as not encrypted");
     assert!(!r.to_string().contains("s3cr3t"), "{r}");
-    let prefs = std::fs::read_to_string(lib.join("prefs.json")).unwrap();
-    assert!(prefs.contains("s3cr3t"), "stored in prefs.json (plaintext in v1, labelled so)");
+    // the key lands in the per-user settings file (scratch path here), never in the library
+    let store = std::fs::read_to_string(lib.join("immich.json")).unwrap();
+    assert!(store.contains("s3cr3t"), "stored in the settings file (plaintext in v1, labelled so)");
+    assert!(
+        !std::fs::read_to_string(lib.join("prefs.json")).unwrap_or_default().contains("s3cr3t"),
+        "the library's prefs.json must not carry the key"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(lib.join("prefs.json")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(lib.join("immich.json")).unwrap().permissions().mode() & 0o777, 0o600, "private by creation");
     }
     // re-adding the same url replaces the entry (fixing a key shouldn't pile up servers)
     let r = s.execute("immich.servers", &json!({"add": {"url": "http://127.0.0.1:9", "apiKey": "new", "name": "Home"}})).unwrap();
@@ -153,16 +159,17 @@ fn servers_are_configured_without_ever_echoing_the_key() {
 
 #[test]
 fn a_passing_test_marks_the_server_verified_and_readding_resets_it() {
-    let lib = temp_dir("verify");
+    let lib = temp_dir("verifymark");
     let (base, _seen, _h) = start(vec![reply_json(200, r#"{"res":"pong"}"#), reply_json(200, r#"{"major":1,"minor":135,"patch":3}"#)]);
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
     s.open_library(&lib, false).unwrap();
     add_server(&mut s, &base);
     assert!(!s.immich_servers[0].verified, "a fresh server is not verified");
     let r = s.execute("immich.test", &json!({})).unwrap();
     assert_eq!(r["version"], "1.135.3", "{r}");
     assert!(s.immich_servers[0].verified, "a passing test verifies the server");
-    assert!(std::fs::read_to_string(lib.join("prefs.json")).unwrap().contains("\"verified\": true"), "the flag is persisted");
+    assert!(std::fs::read_to_string(lib.join("immich.json")).unwrap().contains("\"verified\": true"), "the flag is persisted");
     // re-adding the same url replaces the entry — a changed key or URL needs a new test
     let r = s.execute("immich.servers", &json!({"add": {"url": base, "apiKey": "k2", "name": "Home"}})).unwrap();
     assert_eq!(r["servers"].as_array().map(Vec::len), Some(1), "{r}");
@@ -174,6 +181,7 @@ fn a_passing_test_marks_the_server_verified_and_readding_resets_it() {
 fn verify_records_a_passed_test_without_touching_the_network() {
     // nothing listens on port 9 — `verify` only records a result, it must not dial anything
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(temp_dir("verify").join("immich.json"));
     add_server(&mut s, "http://127.0.0.1:9");
     let r = s.execute("immich.verify", &json!({"server": "Home"})).unwrap();
     assert_eq!(r["servers"][0]["verified"], true, "{r}");
@@ -194,6 +202,7 @@ fn browse_resolves_the_album_by_name_and_maps_the_page() {
         ),
     ]);
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(temp_dir("browse").join("immich.json"));
     add_server(&mut s, &base);
     let r = s.execute("immich.browse", &json!({"server": "Home", "album": "trip", "isFavorite": true, "rating": 4, "pageSize": 1})).unwrap();
     let got = take(&seen);
@@ -222,6 +231,7 @@ fn import_downloads_then_runs_the_library_import_pipeline() {
         reply_bytes(200, "image/png", png(2)),
     ]);
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
     s.open_library(&lib, false).unwrap();
     add_server(&mut s, &base);
     let r = s.execute("immich.import", &json!({"server": "Home", "ids": ["a1", "a2"]})).unwrap();
@@ -262,11 +272,10 @@ fn import_staging_is_a_fresh_private_folder_per_run() {
     // `add` keeps the staged files (and their folder) in place, so the folder is inspectable
     // afterwards: one per import, named beyond the bare pid, and 0700 on Unix.
     let lib = temp_dir("impstage");
-    let (base, _seen, h) = start(vec![
-        reply_json(200, r#"{"id":"a1","checksum":"c1","originalFileName":"STAGE_ME_42.JPG"}"#),
-        reply_bytes(200, "image/png", png(4)),
-    ]);
+    let (base, _seen, h) =
+        start(vec![reply_json(200, r#"{"id":"a1","checksum":"c1","originalFileName":"STAGE_ME_42.JPG"}"#), reply_bytes(200, "image/png", png(4))]);
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
     s.open_library(&lib, false).unwrap();
     add_server(&mut s, &base);
     let r = s.execute("immich.import", &json!({"server": "Home", "ids": ["a1"], "mode": "add"})).unwrap();
@@ -302,21 +311,23 @@ fn import_with_a_multibyte_id_and_no_file_name_does_not_panic() {
     // old byte cut `id[..64]` mid-character, which panicked before the fix.
     let lib = temp_dir("impmb");
     let id = "€".repeat(80);
-    let (base, _seen, h) = start(vec![
-        reply_json(200, r#"{"id":"x","checksum":"c1","originalFileName":""}"#),
-        reply_bytes(200, "image/png", png(3)),
-    ]);
+    let (base, _seen, h) = start(vec![reply_json(200, r#"{"id":"x","checksum":"c1","originalFileName":""}"#), reply_bytes(200, "image/png", png(3))]);
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
     s.open_library(&lib, false).unwrap();
     add_server(&mut s, &base);
     let r = s.execute("immich.import", &json!({"server": "Home", "ids": [id]})).unwrap();
     h.join().unwrap();
     assert_eq!(r["report"]["imported"].as_array().map(Vec::len), Some(1), "{r}");
     let want = format!("immich-{}", "€".repeat(64));
-    let name = s.catalog.photos().map(|ph| match &ph.source {
-        lightcraft_catalog::Source::File { path } => std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()),
-        _ => None,
-    }).flatten().next().unwrap_or_default();
+    let name = s
+        .catalog
+        .photos()
+        .find_map(|ph| match &ph.source {
+            lightcraft_catalog::Source::File { path } => std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .unwrap_or_default();
     assert_eq!(name, want, "the fallback name is 64 chars of the id, at a char boundary");
     let _ = std::fs::remove_dir_all(&lib);
 }
@@ -326,6 +337,7 @@ fn import_needs_ids_and_names_what_it_could_not_fetch() {
     let lib = temp_dir("impfail");
     let (base, _seen, _h) = start(vec![reply_json(500, r#"{"message":"volume full"}"#)]);
     let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
     s.open_library(&lib, false).unwrap();
     add_server(&mut s, &base);
     let e = s.execute("immich.import", &json!({"server": "Home", "ids": []})).unwrap_err().to_string();

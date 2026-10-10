@@ -132,6 +132,7 @@ fn browse_select_and_import_round_trip_through_the_dialog() {
     let (base, seen) = start_router(64).unwrap();
     let lib = temp_dir("e2e").unwrap();
     let mut session = lightcraft_engine::Session::new().with_fs();
+    session.immich_store = Some(lib.join("immich.json"));
     session.open_library(&lib, false).unwrap();
     session.execute("immich.servers", &json!({"add": {"url": base, "apiKey": "k", "name": "Home"}})).unwrap();
     let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
@@ -187,7 +188,9 @@ fn an_unreachable_server_shows_an_actionable_error_and_survives() {
         drop(l); // nothing listens: connecting is refused at once
         format!("http://{a}")
     };
+    let lib = temp_dir("dead").unwrap();
     let mut session = lightcraft_engine::Session::new().with_fs();
+    session.immich_store = Some(lib.join("immich.json"));
     session.execute("immich.servers", &json!({"add": {"url": dead, "apiKey": "k", "name": "Dead"}})).unwrap();
     let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
     let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
@@ -207,6 +210,7 @@ fn import_from_immich_unlocks_only_after_the_settings_test_passes() {
     let (base, seen) = start_router(64).unwrap();
     let lib = temp_dir("settings").unwrap();
     let mut session = lightcraft_engine::Session::new().with_fs();
+    session.immich_store = Some(lib.join("immich.json"));
     session.open_library(&lib, false).unwrap();
     let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
     let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
@@ -257,6 +261,7 @@ fn a_file_the_library_cannot_import_names_the_reason() {
     let (base, _seen) = start_router(64).unwrap();
     let lib = temp_dir("badfile").unwrap();
     let mut session = lightcraft_engine::Session::new().with_fs();
+    session.immich_store = Some(lib.join("immich.json"));
     session.open_library(&lib, false).unwrap();
     session.execute("immich.servers", &json!({"add": {"url": base, "apiKey": "k", "name": "Home"}})).unwrap();
     session.execute("immich.verify", &json!({"server": "Home"})).unwrap();
@@ -288,6 +293,7 @@ fn the_integrations_tab_adds_a_server_from_its_form() {
     let (base, _seen) = start_router(8).unwrap();
     let lib = temp_dir("addform").unwrap();
     let mut session = lightcraft_engine::Session::new().with_fs();
+    session.immich_store = Some(lib.join("immich.json"));
     session.open_library(&lib, false).unwrap();
     let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
     let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
