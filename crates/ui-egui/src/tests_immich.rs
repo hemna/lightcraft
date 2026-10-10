@@ -17,7 +17,7 @@ use crate::{LightcraftApp, Services};
 const T: Duration = Duration::from_secs(20);
 const SETTLE: Duration = Duration::from_secs(60);
 
-const ASSET: &str = r#"{"assets":{"total":1,"count":1,"items":[{"id":"a1","checksum":"c1","originalFileName":"IMG_1.JPG","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":false,"rating":0,"width":48,"height":32}],"nextPage":null}}"#;
+const ASSET: &str = r#"{"assets":{"total":2,"count":2,"items":[{"id":"a1","checksum":"c1","originalFileName":"IMG_1.JPG","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":false,"rating":0,"width":48,"height":32},{"id":"b1","checksum":"c2","originalFileName":"BAD.JPG","fileCreatedAt":"2026-01-02T03:04:06.000Z","isFavorite":false,"rating":0,"width":48,"height":32}],"nextPage":null}}"#;
 
 fn png(seed: u8) -> Option<Vec<u8>> {
     let (w, h) = (48usize, 32usize);
@@ -99,6 +99,10 @@ fn route(head: &str) -> (u16, &'static str, Vec<u8>) {
         "/api/assets/a1" => (200, "application/json", r#"{"id":"a1","checksum":"c1","originalFileName":"IMG_1.JPG"}"#.as_bytes().to_vec()),
         "/api/assets/a1/thumbnail" => png(7).map_or((404, "text/plain", Vec::new()), |b| (200, "image/png", b)),
         "/api/assets/a1/original" => png(9).map_or((404, "text/plain", Vec::new()), |b| (200, "image/png", b)),
+        // a file the library cannot import: the download works, the bytes are not an image
+        "/api/assets/b1" => (200, "application/json", r#"{"id":"b1","checksum":"c2","originalFileName":"BAD.JPG"}"#.as_bytes().to_vec()),
+        "/api/assets/b1/thumbnail" => (404, "text/plain", Vec::new()),
+        "/api/assets/b1/original" => (200, "application/octet-stream", b"not a jpeg, not anything".to_vec()),
         _ => (404, "text/plain", Vec::new()),
     }
 }
@@ -238,6 +242,37 @@ fn import_from_immich_unlocks_only_after_the_settings_test_passes() {
     assert_eq!(r["ok"], true, "{r}");
     assert!(h.app.session.immich_servers.is_empty(), "the server is gone");
     assert_eq!(menu_enabled(&mut h, "file.importImmich"), Some(false), "locked again with no server");
+    h.settle(SETTLE);
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+#[test]
+fn a_file_the_library_cannot_import_names_the_reason() {
+    let (base, _seen) = start_router(64).unwrap();
+    let lib = temp_dir("badfile").unwrap();
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.open_library(&lib, false).unwrap();
+    session.execute("immich.servers", &json!({"add": {"url": base, "apiKey": "k", "name": "Home"}})).unwrap();
+    session.execute("immich.verify", &json!({"server": "Home"})).unwrap();
+    let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
+
+    h.request("engine.execute", json!({"command": "file.importImmich"}), T);
+    h.settle(SETTLE);
+    h.request("ui.clickWidget", json!({"id": "button:immichSearch"}), T);
+    let found = h.step_until(SETTLE, |h| assets(h).iter().any(|id| id == "b1"));
+    assert!(found, "the page shows the bad asset");
+    h.settle(SETTLE); // the grid changes the window size; let it restabilize
+    let r = h.request("ui.clickWidget", json!({"id": "immich:1"}), T);
+    assert_eq!(r["ok"], true, "the second cell is on screen: {r}");
+    h.request("ui.clickWidget", json!({"id": "button:immichImport"}), T);
+    let done = h.step_until(SETTLE, |h| h.app.immich_task.as_ref().is_some_and(|t| t.import_done));
+    assert!(done, "the import finished");
+    let failed = h.app.immich_task.as_ref().unwrap().failed.clone();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(failed[0].starts_with("BAD.JPG"), "the file is named: {failed:?}");
+    assert!(!failed[0].ends_with("import failed"), "the library's own reason, not the generic stand-in: {failed:?}");
+    assert_eq!(h.app.session.catalog.len(), 0, "nothing was imported");
     h.settle(SETTLE);
     let _ = std::fs::remove_dir_all(&lib);
 }

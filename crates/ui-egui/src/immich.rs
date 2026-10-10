@@ -475,7 +475,14 @@ fn commit_batch(app: &mut LightcraftApp, task: &mut ImmichTask) {
             task.imported += len("imported");
             task.skipped += len("duplicates");
             for entry in v["failed"].as_array().into_iter().flatten() {
-                task.failed.push(format!("{}: {}", entry["path"].as_str().unwrap_or(""), entry["error"].as_str().unwrap_or("import failed")));
+                // the report's `failed` is (path, reason) pairs: the file name and the library's
+                // own reason ("Heif files are not supported yet"), never a generic stand-in
+                let (path, reason) = entry
+                    .as_array()
+                    .map(|a| (a.first().and_then(Value::as_str).unwrap_or(""), a.get(1).and_then(Value::as_str).unwrap_or("import failed")))
+                    .unwrap_or(("", "import failed"));
+                let name = path.rsplit('/').next().unwrap_or(path);
+                task.failed.push(format!("{name}: {reason}"));
             }
             task.done += n;
             // the bytes are in the library now; the staged copies have no further use
