@@ -164,9 +164,41 @@ pub struct Paged<T> {
     pub maybe_more: bool,
 }
 
+/// `/search/metadata` answers `assets` as a page object `{total, count, items, nextPage}`
+/// (current servers) or as a bare array (older ones). Both mean the same page here.
 #[derive(Deserialize, Default)]
 struct SearchResponse {
-    assets: Vec<Asset>,
+    #[serde(default)]
+    assets: AssetsAnswer,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AssetsAnswer {
+    Paged {
+        #[serde(default)]
+        items: Vec<Asset>,
+        /// A page cursor (a number or a string); only its presence matters.
+        #[serde(default, rename = "nextPage")]
+        next_page: Option<serde_json::Value>,
+    },
+    Plain(Vec<Asset>),
+}
+
+impl Default for AssetsAnswer {
+    fn default() -> Self {
+        AssetsAnswer::Plain(Vec::new())
+    }
+}
+
+impl AssetsAnswer {
+    /// The page's items, and whether the server says another page follows.
+    fn into_page(self) -> (Vec<Asset>, bool) {
+        match self {
+            AssetsAnswer::Paged { items, next_page } => (items, next_page.is_some()),
+            AssetsAnswer::Plain(v) => (v, false),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -323,9 +355,10 @@ impl Client {
         let body = serde_json::to_vec(&serde_json::json!({ "query": query.body() })).map_err(|e| Error::Api { status: 0, message: e.to_string() })?;
         let mut resp = self.send("POST", "/search/metadata", Some(&body), Some("application/json"))?;
         let page: SearchResponse = self.json(&mut resp)?;
-        let got = page.assets.len() as u64;
+        let (assets, next_page) = page.assets.into_page();
+        let got = assets.len() as u64;
         let size = u64::from(query.page_size.clamp(1, 1000));
-        Ok(Paged { items: page.assets, page: if query.page == 0 { 1 } else { query.page }, maybe_more: got >= size })
+        Ok(Paged { items: assets, page: if query.page == 0 { 1 } else { query.page }, maybe_more: next_page || got >= size })
     }
 
     /// Every album (`GET /albums`).

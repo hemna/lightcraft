@@ -59,11 +59,12 @@ pub fn start(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Captured>>>, std::th
             let Ok(mut stream) = stream else { break };
             if let Some(c) = read_request(&mut stream) {
                 let reply = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                // captured before the reply is written: the client cannot finish the call
+                // before the capture is visible to the test
+                s.lock().unwrap_or_else(|e| e.into_inner()).push(c);
                 if let Some(r) = reply {
                     write_reply(&mut stream, &r);
                 }
-                let mut seen = s.lock().unwrap_or_else(|e| e.into_inner());
-                seen.push(c);
             }
             done += 1;
             if done >= total {
@@ -216,10 +217,11 @@ fn a_redirect_without_a_location_says_so() {
 
 #[test]
 fn a_search_sends_our_filters_and_reads_camelcase_assets() {
+    // the first answer is the current servers' page object, the second a bare array (older ones)
     let (base, seen, h) = start(vec![
         json(
             200,
-            r#"{"assets":[{"id":"a1","checksum":"beef","originalFileName":"IMG_1.HEIC","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":true,"rating":4,"newThing":{"x":1}}],"count":1,"nextPage":null}"#,
+            r#"{"assets":{"total":1,"count":1,"items":[{"id":"a1","checksum":"beef","originalFileName":"IMG_1.HEIC","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":true,"rating":4,"newThing":{"x":1}}],"nextPage":null}}"#,
         ),
         json(200, r#"{"assets":[{"id":"a1","checksum":"beef","originalFileName":"IMG_1.HEIC","isFavorite":false}],"count":1}"#),
     ]);
@@ -239,7 +241,21 @@ fn a_search_sends_our_filters_and_reads_camelcase_assets() {
     let short = client.search(&SearchQuery { page_size: 100, ..Default::default() }).unwrap();
     assert!(!short.maybe_more, "a short page means the end");
     assert_eq!(short.page, 1);
-    assert!(short.items.first().unwrap().file_created_at.is_none());
+    assert_eq!(short.items.first().unwrap().file_created_at, None, "the bare-array answer is read too");
+    h.join().unwrap();
+}
+
+#[test]
+fn a_next_page_cursor_means_more_pages() {
+    // a current server says there is another page even when the page came back short
+    let (base, _seen, h) = start(vec![json(
+        200,
+        r#"{"assets":{"total":9,"count":1,"items":[{"id":"a1","checksum":"beef","originalFileName":"IMG_1.HEIC"}],"nextPage":3}}"#,
+    )]);
+    let client = Client::new(&base, "k", Limits::default()).unwrap();
+    let page = client.search(&SearchQuery { page_size: 60, ..Default::default() }).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(page.maybe_more, "the server says a page follows");
     h.join().unwrap();
 }
 

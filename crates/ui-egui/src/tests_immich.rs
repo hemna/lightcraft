@@ -17,7 +17,7 @@ use crate::{LightcraftApp, Services};
 const T: Duration = Duration::from_secs(20);
 const SETTLE: Duration = Duration::from_secs(60);
 
-const ASSET: &str = r#"{"assets":[{"id":"a1","checksum":"c1","originalFileName":"IMG_1.JPG","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":false,"rating":0,"width":48,"height":32}]}"#;
+const ASSET: &str = r#"{"assets":{"total":1,"count":1,"items":[{"id":"a1","checksum":"c1","originalFileName":"IMG_1.JPG","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":false,"rating":0,"width":48,"height":32}],"nextPage":null}}"#;
 
 fn png(seed: u8) -> Option<Vec<u8>> {
     let (w, h) = (48usize, 32usize);
@@ -110,13 +110,6 @@ fn temp_dir(tag: &str) -> Option<PathBuf> {
     Some(d)
 }
 
-fn dialog_lines(h: &Headless) -> (Option<String>, Option<String>) {
-    match &h.app.ui.dialog {
-        Some(Dialog::Immich { opts }) => (opts.error.clone(), opts.info.clone()),
-        _ => (None, None),
-    }
-}
-
 fn assets(h: &Headless) -> Vec<String> {
     match &h.app.ui.dialog {
         Some(Dialog::Immich { opts }) => opts.assets.iter().map(|a| a.id.clone()).collect(),
@@ -147,14 +140,6 @@ fn browse_select_and_import_round_trip_through_the_dialog() {
     h.settle(SETTLE); // let the window finish laying out before clicking it
 
     // Search: the page arrives over the worker channel, not on the UI thread.
-    let r = h.request("ui.clickWidget", json!({"id": "button:immichTest"}), T);
-    assert_eq!(r["ok"], true, "{r}");
-    let ponged = h.step_until(SETTLE, |h| {
-        let (e, i) = dialog_lines(h);
-        e.is_some() || i.is_some()
-    });
-    assert!(ponged, "the Test button answers something");
-    h.settle(SETTLE); // the answer line changes the window size again
     let r = h.request("ui.clickWidget", json!({"id": "button:immichSearch"}), T);
     assert_eq!(r["ok"], true, "{r}");
     let found = h.step_until(SETTLE, |h| assets(h).iter().any(|id| id == "a1"));

@@ -190,7 +190,7 @@ fn browse_resolves_the_album_by_name_and_maps_the_page() {
         reply_json(200, r#"[{"id":"al1","albumName":"Trip","assetCount":2}]"#),
         reply_json(
             200,
-            r#"{"assets":[{"id":"a1","checksum":"cafe","originalFileName":"IMG_1.JPG","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":true,"rating":4,"other":1}]}"#,
+            r#"{"assets":{"total":1,"count":1,"items":[{"id":"a1","checksum":"cafe","originalFileName":"IMG_1.JPG","fileCreatedAt":"2026-01-02T03:04:05.000Z","isFavorite":true,"rating":4,"other":1}],"nextPage":null}}"#,
         ),
     ]);
     let mut s = Session::new().with_fs();

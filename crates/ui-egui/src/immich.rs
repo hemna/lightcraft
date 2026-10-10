@@ -92,23 +92,34 @@ pub struct ImmichAsset {
     pub rating: Option<u32>,
 }
 
-/// Parse the dialog's "from" date: exactly `YYYY-MM-DD`, a sane calendar day; `None` for anything
-/// else (an empty field is not an error — the caller only calls this on non-empty text).
+/// Parse the dialog's "from" date: `YYYY`, `YYYY-MM` or `YYYY-MM-DD` — a partial date means the
+/// start of that year or month ("2024" is 2024-01-01, "2024-06" is 2024-06-01). `None` for
+/// anything else (an empty field is not an error — the caller only calls this on non-empty text).
 pub fn parse_date(text: &str) -> Option<String> {
     let t = text.trim();
     let b = t.as_bytes();
-    if b.len() != 10 || b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') {
+    // the separators each present length has, and the month/day it defaults to
+    let (month, day) = match b.len() {
+        4 => ("01", "01"),
+        7 => (t.get(5..7)?, "01"),
+        10 => (t.get(5..7)?, t.get(8..10)?),
+        _ => return None,
+    };
+    if (b.len() >= 7 && b.get(4) != Some(&b'-')) || (b.len() == 10 && b.get(7) != Some(&b'-')) {
         return None;
     }
-    let num = |r: std::ops::Range<usize>| {
-        let part = t.get(r)?;
+    let num = |part: &str| {
         if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()) {
             return None;
         }
         part.parse::<u32>().ok()
     };
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    if (1900..=2999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day) { Some(t.to_string()) } else { None }
+    let (year, month, day) = (num(t.get(0..4)?)?, num(month)?, num(day)?);
+    if (1900..=2999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day) {
+        Some(format!("{year:04}-{month:02}-{day:02}"))
+    } else {
+        None
+    }
 }
 
 impl ImmichDialog {
@@ -154,10 +165,6 @@ enum Event {
     Albums {
         generation: u64,
         result: Result<Vec<AlbumRow>, String>,
-    },
-    Test {
-        generation: u64,
-        result: Result<String, String>,
     },
     Search {
         generation: u64,
@@ -341,23 +348,6 @@ fn start_albums(task: &mut ImmichTask, ctx: &egui::Context) {
         let _ = tx.send(Event::Albums { generation, result: r.flatten() });
     }) {
         task.albums_busy = false;
-        log::warn!("immich: {e}");
-    }
-}
-
-/// Ask for the server's ping + version on a worker (the Test button).
-fn start_test(task: &ImmichTask, ctx: &egui::Context) {
-    let (generation, tx) = (task.generation.load(Ordering::Relaxed), task.tx.clone());
-    let (url, key) = (task.server_url.clone(), task.server_key.clone());
-    if let Err(e) = spawn("lc-immich-test", ctx, move || {
-        let r = lightcraft_engine::guard::catch("immich test", move || {
-            let c = Client::new(&url, &key, Limits::default()).map_err(|e| e.to_string())?;
-            let pong = c.ping().map_err(|e| e.to_string())?;
-            let version = c.version().map(|v| v.to_string()).unwrap_or_else(|_| "version unknown".into());
-            Ok(format!("{pong} · Immich {version}"))
-        });
-        let _ = tx.send(Event::Test { generation, result: r.flatten() });
-    }) {
         log::warn!("immich: {e}");
     }
 }
@@ -632,10 +622,7 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     // a settings-tab Test that finished while nobody was looking gets its verify here
     verify_fresh_settings_tests(app, ctx);
     let Some(mut task) = app.immich_task.take() else { return };
-    // the Test and Cancel buttons ask for these; the work happens here, not in the paint pass
-    if take_flag(ctx, TEST_FLAG) && !task.server_url.is_empty() {
-        start_test(&task, ctx);
-    }
+    // the Cancel button asks for this; the work happens here, not in the paint pass
     if take_flag(ctx, CANCEL_FLAG) {
         task.cancelled = true;
         if let Some(run) = &task.import {
@@ -672,23 +659,6 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 match result {
                     Ok(list) => task.albums = list,
                     Err(e) => set_dialog_lines(app, Some(e), None),
-                }
-            }
-            Event::Test { generation, result } => {
-                if generation == task.generation.load(Ordering::Relaxed) {
-                    match result {
-                        Ok(v) => {
-                            set_dialog_lines(app, None, Some(v));
-                            // a passing test is what unlocks Import from Immich for this server
-                            if let Some(Dialog::Immich { opts }) = &app.ui.dialog {
-                                let name = opts.server.clone();
-                                if !name.is_empty() {
-                                    let _ = app.run("immich.verify", json!({ "server": name }));
-                                }
-                            }
-                        }
-                        Err(e) => set_dialog_lines(app, Some(e), None),
-                    }
                 }
             }
             Event::Search { generation, page, result } => {
@@ -774,7 +744,6 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImmichDialog) {
     let servers: Vec<String> = app.session.immich_servers.iter().map(|s| s.name.clone()).collect();
     let albums: Vec<AlbumRow> = app.immich_task.as_ref().map(|x| x.albums.clone()).unwrap_or_default();
     let searching = app.immich_task.as_ref().is_some_and(|x| x.searching);
-    let (srv_url, _) = server_url_key(&app.session, &d.server).unwrap_or_default();
 
     if servers.is_empty() {
         ui.label(egui::RichText::new(crate::i18n::tr("No Immich server is configured yet.")).color(t.text_label));
@@ -803,7 +772,6 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImmichDialog) {
         });
         register(ui.ctx(), "combo:immichServer", combo.response.rect);
     });
-    test_button(ui, &srv_url);
     if let Some(name) = picked_server {
         d.server = name;
         d.album_id.clear();
@@ -882,13 +850,14 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImmichDialog) {
         if let Some(n) = rate {
             d.rating = n;
         }
-        let r = ui.add(egui::TextEdit::singleline(&mut d.from_date).hint_text(crate::i18n::tr("From (YYYY-MM-DD)")).desired_width(130.0));
+        let r = ui
+            .add(egui::TextEdit::singleline(&mut d.from_date).hint_text(crate::i18n::tr("From (YYYY, YYYY-MM or YYYY-MM-DD)")).desired_width(170.0));
         register(ui.ctx(), "field:immichFrom", r.rect);
         let r = ui.add_enabled(!searching, egui::Button::new(crate::i18n::tr("Search")));
         register(ui.ctx(), "button:immichSearch", r.rect);
         if r.clicked() {
             if !d.from_date.trim().is_empty() && parse_date(&d.from_date).is_none() {
-                d.error = Some(crate::i18n::tr("Enter the date as YYYY-MM-DD, or leave it empty.").to_string());
+                d.error = Some(crate::i18n::tr("Enter the date as YYYY, YYYY-MM or YYYY-MM-DD, or leave it empty.").to_string());
             } else {
                 search_page = Some(1);
             }
@@ -954,15 +923,6 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImmichDialog) {
     }
 }
 
-/// The dialog's Test button: ping + version on a worker, the answer as a status line.
-fn test_button(ui: &mut egui::Ui, url: &str) {
-    let r = ui.add_enabled(!url.is_empty(), egui::Button::new(crate::i18n::tr("Test")));
-    register(ui.ctx(), "button:immichTest", r.rect);
-    if r.clicked() {
-        request_flag(ui.ctx(), TEST_FLAG);
-    }
-}
-
 /// Set a button's request flag (egui memory, so it belongs to this app — a second app in the
 /// same process, like a parallel test, never sees it).
 fn request_flag(ctx: &egui::Context, flag: &str) {
@@ -979,8 +939,7 @@ fn take_flag(ctx: &egui::Context, flag: &str) -> bool {
     v
 }
 
-/// The Test and Cancel buttons set these; [`tick`] (which owns the task) takes them.
-const TEST_FLAG: &str = "immich-test-requested";
+/// The Cancel button sets this; [`tick`] (which owns the task) takes it.
 const CANCEL_FLAG: &str = "immich-cancel-requested";
 
 /// The import phase of the dialog: the progress bar, the failures, and Cancel.
@@ -1272,9 +1231,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_date_accepts_only_a_plain_iso_day() {
+    fn parse_date_accepts_a_year_a_month_or_a_full_day() {
         assert_eq!(parse_date("2026-01-31").as_deref(), Some("2026-01-31"));
         assert_eq!(parse_date("  2026-01-31 ").as_deref(), Some("2026-01-31"));
+        // partial dates mean the start of that year or month
+        assert_eq!(parse_date("2026").as_deref(), Some("2026-01-01"));
+        assert_eq!(parse_date("2026-06").as_deref(), Some("2026-06-01"));
+        assert_eq!(parse_date("2026-6"), None, "the month is padded");
         assert_eq!(parse_date("2026-1-31"), None, "padded only");
         assert_eq!(parse_date("2026-13-01"), None, "month 13");
         assert_eq!(parse_date("2026-00-10"), None, "month 0");
@@ -1282,6 +1245,8 @@ mod tests {
         assert_eq!(parse_date("2026-01-31T10:00"), None, "no timestamps");
         assert_eq!(parse_date(""), None);
         assert_eq!(parse_date("2026-01-3"), None);
+        assert_eq!(parse_date("202"), None, "a short year");
+        assert_eq!(parse_date("26"), None);
         // a full-width lookalike cannot slip past the byte checks
         assert_eq!(parse_date("2026－01-31"), None);
     }
