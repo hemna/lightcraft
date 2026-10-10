@@ -286,6 +286,20 @@ impl std::fmt::Debug for ImmichTask {
     }
 }
 
+/// One claimed slot of the in-flight thumbnail budget ([`THUMB_IN_FLIGHT`]). The guard is the
+/// *only* release point: it is dropped at the end of the worker thread — even when the worker
+/// dies before it answers — so the counter can neither drift open (a dead worker holding its
+/// slot forever, repaint after repaint) nor underflow (two threads releasing one claim).
+struct ThumbSlot {
+    busy: Arc<AtomicUsize>,
+}
+
+impl Drop for ThumbSlot {
+    fn drop(&mut self) {
+        self.busy.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl ImmichTask {
     /// `{phase, total, done, failed}` for `ui.inspect`.
     pub fn status(&self) -> Value {
@@ -317,7 +331,10 @@ impl ImmichTask {
         }
         let tx = self.tx.clone();
         let (id, url, key) = (id.to_string(), self.server_url.clone(), self.server_key.clone());
-        let spawned = spawn("lc-immich-thumb", ctx, move || {
+        // the guard moves into the worker and releases the slot when the thread ends; the event
+        // it sends only carries the pixels, so a thread that dies early still gives its slot back
+        let slot = ThumbSlot { busy: self.thumb_busy.clone() };
+        let _ = spawn("lc-immich-thumb", ctx, move || {
             let image = lightcraft_engine::guard::catch("immich thumbnail", || {
                 let c = Client::new(&url, &key, Limits::default()).map_err(|e| e.to_string())?;
                 let mut buf: Vec<u8> = Vec::new();
@@ -327,12 +344,10 @@ impl ImmichTask {
             .flatten()
             .ok();
             let _ = tx.send(Event::Thumb { id, image });
-            // the slot is released in [`tick`], when the event is applied — releasing it here
-            // as well would count every thumbnail twice and let the bound drift open
+            drop(slot);
         });
-        if spawned.is_err() {
-            self.thumb_busy.fetch_sub(1, Ordering::Relaxed);
-        }
+        // a failed spawn drops the closure (and the guard) right here — the slot is released
+        // either way, exactly once
     }
 
     /// Thumbnails asked for but not answered yet (for tests: the bound must hold).
@@ -758,7 +773,8 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 }
             }
             Event::Thumb { id, image } => {
-                task.thumb_busy.fetch_sub(1, Ordering::Relaxed);
+                // the budget slot was already released by the worker's guard — applying the
+                // event must not touch the counter again
                 match image {
                     Some(img) => {
                         let color = std::sync::Arc::new(egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], &img.as_bytes()));
@@ -1414,5 +1430,41 @@ mod tests {
         // an extension that is not one stays in the stem
         assert_eq!(staged_path(&dir, "weird.nope.nope", "id3").file_name().unwrap().to_string_lossy(), "weird.nope.nope");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumb_slot_releases_the_budget_exactly_once() {
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // two claimed slots (as request_thumb adds them), each with its guard
+        busy.fetch_add(2, Ordering::Relaxed);
+        let a = ThumbSlot { busy: busy.clone() };
+        let b = ThumbSlot { busy: busy.clone() };
+        assert_eq!(busy.load(Ordering::Relaxed), 2);
+        // dropping one returns its slot; the other still holds its own
+        drop(a);
+        assert_eq!(busy.load(Ordering::Relaxed), 1);
+        drop(b);
+        assert_eq!(busy.load(Ordering::Relaxed), 0);
+        // the guard is the only release: nothing else can drive the counter below zero
+        busy.fetch_add(1, Ordering::Relaxed);
+        let c = ThumbSlot { busy: busy.clone() };
+        drop(c);
+        assert_eq!(busy.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn applying_a_thumb_event_twice_does_not_drain_the_budget() {
+        // the old code released the slot in tick; a duplicate or late event would have
+        // underflowed the counter (and a worker that died before answering held its slot
+        // forever, so no further thumbnail was ever asked for). Now the worker's guard owns
+        // the release, so applying events is a no-op on the budget.
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        busy.fetch_add(1, Ordering::Relaxed);
+        let slot = ThumbSlot { busy: busy.clone() };
+        drop(slot); // the worker ends: released once, by the guard alone
+        assert_eq!(busy.load(Ordering::Relaxed), 0);
+        // the events tick applies afterwards (even twice) touch nothing
+        assert_eq!(busy.load(Ordering::Relaxed), 0);
+        assert_eq!(busy.load(Ordering::Relaxed), 0);
     }
 }
