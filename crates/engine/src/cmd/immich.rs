@@ -281,7 +281,9 @@ fn safe_file_name(given: &str, id: &str) -> String {
         base.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c }).collect();
     let trimmed = out.trim_matches(|c| c == ' ' || c == '.');
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        return format!("immich-{}", &id[..id.len().min(64)]);
+        // a byte cut here would panic on a multi-byte id (the name is agent- or server-supplied)
+        let short: String = id.chars().take(64).collect();
+        return format!("immich-{short}");
     }
     if out.chars().count() > 200 {
         out = out.chars().take(200).collect();

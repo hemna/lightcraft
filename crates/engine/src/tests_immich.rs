@@ -258,6 +258,32 @@ fn import_downloads_then_runs_the_library_import_pipeline() {
 }
 
 #[test]
+fn import_with_a_multibyte_id_and_no_file_name_does_not_panic() {
+    // the asset's id is agent-supplied and may be multi-byte text: with an empty file name the
+    // fallback `immich-<id…>` must cut at a char boundary. 80 three-byte chars put the old
+    // byte cut `id[..64]` inside the character at bytes 63..66, which panicked before the fix.
+    let lib = temp_dir("impmb");
+    let id = "€".repeat(80);
+    let (base, _seen, h) = start(vec![
+        reply_json(200, r#"{"id":"x","checksum":"c1","originalFileName":""}"#),
+        reply_bytes(200, "image/png", png(3)),
+    ]);
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    add_server(&mut s, &base);
+    let r = s.execute("immich.import", &json!({"server": "Home", "ids": [id]})).unwrap();
+    h.join().unwrap();
+    assert_eq!(r["report"]["imported"].as_array().map(Vec::len), Some(1), "{r}");
+    let want = format!("immich-{}", "€".repeat(64));
+    let name = s.catalog.photos().map(|ph| match &ph.source {
+        lightcraft_catalog::Source::File { path } => std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()),
+        _ => None,
+    }).flatten().next().unwrap_or_default();
+    assert_eq!(name, want, "the fallback name is 64 chars of the id, at a char boundary");
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+#[test]
 fn import_needs_ids_and_names_what_it_could_not_fetch() {
     let lib = temp_dir("impfail");
     let (base, _seen, _h) = start(vec![reply_json(500, r#"{"message":"volume full"}"#)]);
