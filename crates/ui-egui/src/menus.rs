@@ -1477,8 +1477,9 @@ pub fn ui_enabled(app: &LightcraftApp, id: &str) -> bool {
         "view.compare" => app.session.catalog.len() > 1,
         "view.fullScreenPreview" | "view.infoOverlay" | "view.navigator" => app.session.active().is_some() || app.ui.fullscreen,
         "app.openLibrary" | "file.addFolder" => app.services.pick_folder.is_some() && !crate::lightroom_import::is_running(app),
-        // (native: the browser runs on a worker thread over `lightcraft-immich`)
-        "file.importImmich" => !cfg!(target_arch = "wasm32"),
+        // (native: the browser runs on a worker thread over `lightcraft-immich`; and a server
+        // must have passed a test in Settings ▸ Integrations first)
+        "file.importImmich" => !cfg!(target_arch = "wasm32") && app.session.immich_servers.iter().any(|s| s.verified),
         "file.backupLibrary" => app.services.backup_library.is_some(),
         "app.openLogFolder" => app.services.reveal.is_some() && app.services.log_file.is_some(),
         "file.restoreLibrary" => app.services.restore_library.is_some(),

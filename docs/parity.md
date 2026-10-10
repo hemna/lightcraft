@@ -21,7 +21,7 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 <!-- parity:summary -->
 | Section | ✅ | 🟡 | ⬜ | 🚫 | P0 done | P1 done |
 |---|---:|---:|---:|---:|---:|---:|
-| A. Import (IMP) | 11 | 3 | 1 | 1 | 3/5 (60%) | 5/5 (100%) |
+| A. Import (IMP) | 12 | 3 | 1 | 1 | 3/5 (60%) | 6/6 (100%) |
 | B. Library management (LIB) | 22 | 2 | 1 | 2 | 9/9 (100%) | 9/9 (100%) |
 | C. Views & navigation (VIEW) | 15 | 1 | 1 | 0 | 8/9 (89%) | 4/4 (100%) |
 | D. Search & filter (FILT) | 11 | 1 | 1 | 0 | 4/4 (100%) | 4/4 (100%) |
@@ -48,9 +48,9 @@ and prints the summary; `cargo xtask parity --write` refreshes the summary table
 | Y. Menus | 83 | 0 | 4 | 8 | 47/47 (100%) | 23/23 (100%) |
 | Z. Keyboard shortcuts (desktop) | 75 | 3 | 3 | 1 | 49/52 (94%) | 23/24 (96%) |
 | Lightroom Classic extras | 32 | 11 | 39 | 9 | — | 22/24 (92%) |
-| **Total** | 395 | 38 | 84 | 36 | 193/200 (97%) | 142/152 (93%) |
+| **Total** | 396 | 38 | 84 | 36 | 193/200 (97%) | 143/153 (93%) |
 
-Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **80.1%** of 517 in-scope rows — P0 98.2% of 200 · P1 95.7% of 152 · P2 42.9% of 163.
+Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **80.1%** of 518 in-scope rows — P0 98.2% of 200 · P1 95.8% of 153 · P2 42.9% of 163.
 <!-- /parity:summary -->
 
 ## Top gaps

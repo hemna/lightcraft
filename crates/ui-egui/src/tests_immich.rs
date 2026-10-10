@@ -92,6 +92,8 @@ fn route(head: &str) -> (u16, &'static str, Vec<u8>) {
     let path = head.split_whitespace().nth(1).unwrap_or_default();
     let (p, _query) = path.split_once('?').unwrap_or((path, ""));
     match p {
+        "/api/server/ping" => (200, "application/json", br#"{"res":"pong"}"#.to_vec()),
+        "/api/server/version" => (200, "application/json", br#"{"major":1,"minor":135,"patch":3}"#.to_vec()),
         "/api/albums" => (200, "application/json", br#"[{"id":"al1","albumName":"Trip","assetCount":1}]"#.to_vec()),
         "/api/search/metadata" => (200, "application/json", ASSET.as_bytes().to_vec()),
         "/api/assets/a1" => (200, "application/json", r#"{"id":"a1","checksum":"c1","originalFileName":"IMG_1.JPG"}"#.as_bytes().to_vec()),
@@ -120,6 +122,12 @@ fn assets(h: &Headless) -> Vec<String> {
         Some(Dialog::Immich { opts }) => opts.assets.iter().map(|a| a.id.clone()).collect(),
         _ => Vec::new(),
     }
+}
+
+/// The File ▸ Import from Immich menu entry's enabled flag, from `ui.menu.list`.
+fn menu_enabled(h: &mut Headless, id: &str) -> Option<bool> {
+    let r = h.request("ui.menu.list", json!({}), T);
+    r["result"].as_array()?.iter().find(|e| e["id"] == id).and_then(|e| e["enabled"].as_bool())
 }
 
 #[test]
@@ -194,4 +202,84 @@ fn an_unreachable_server_shows_an_actionable_error_and_survives() {
     }
     assert!(matches!(h.app.ui.dialog, Some(Dialog::Immich { .. })), "a dead server keeps the dialog open");
     h.settle(SETTLE);
+}
+
+#[test]
+fn import_from_immich_unlocks_only_after_the_settings_test_passes() {
+    let (base, seen) = start_router(64).unwrap();
+    let lib = temp_dir("settings").unwrap();
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.open_library(&lib, false).unwrap();
+    let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
+
+    // no server: the menu item is locked, and the dialog's empty state has no Test button
+    assert_eq!(menu_enabled(&mut h, "file.importImmich"), Some(false), "locked with no server configured");
+    h.request("engine.execute", json!({"command": "file.importImmich"}), T);
+    h.settle(SETTLE);
+    let r = h.request("ui.clickWidget", json!({"id": "button:immichTest"}), T);
+    assert_eq!(r["ok"], false, "the empty state points at Settings instead: {r}");
+
+    // configured but untested: still locked
+    h.request("engine.execute", json!({"command": "immich.servers", "params": {"add": {"url": base, "apiKey": "k", "name": "Home"}}}), T);
+    assert_eq!(h.app.session.immich_servers.len(), 1);
+    assert_eq!(menu_enabled(&mut h, "file.importImmich"), Some(false), "locked until the test passes");
+
+    // Settings ▸ Integrations: the Test button runs on a worker and unlocks the server
+    h.app.ui.dialog = Some(Dialog::Settings { tab: "integrations".into() });
+    h.settle(SETTLE);
+    let r = h.request("ui.clickWidget", json!({"id": "button:immichSettingsTest-Home"}), T);
+    assert_eq!(r["ok"], true, "the settings row has a Test button: {r}");
+    let unlocked = h.step_until(SETTLE, |h| h.app.session.immich_servers.first().is_some_and(|s| s.verified));
+    assert!(unlocked, "the passing test marked the server verified");
+    assert_eq!(menu_enabled(&mut h, "file.importImmich"), Some(true), "unlocked after the test");
+    let got = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(got.iter().any(|c| c.starts_with("GET /api/server/ping")), "{got:?}");
+    assert!(got.iter().any(|c| c.starts_with("GET /api/server/version")), "{got:?}");
+
+    // the dialog opens against the tested server and loads its albums
+    h.app.ui.dialog = None;
+    h.request("engine.execute", json!({"command": "file.importImmich"}), T);
+    let albums = h.step_until(SETTLE, |h| h.app.immich_task.as_ref().is_some_and(|t| !t.albums.is_empty()));
+    assert!(albums, "the dialog browses the tested server");
+
+    // removing the server locks the menu again
+    h.app.ui.dialog = Some(Dialog::Settings { tab: "integrations".into() });
+    h.settle(SETTLE);
+    let r = h.request("ui.clickWidget", json!({"id": "button:immichSettingsRemove-Home"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(h.app.session.immich_servers.is_empty(), "the server is gone");
+    assert_eq!(menu_enabled(&mut h, "file.importImmich"), Some(false), "locked again with no server");
+    h.settle(SETTLE);
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+#[test]
+fn the_integrations_tab_adds_a_server_from_its_form() {
+    let (base, _seen) = start_router(8).unwrap();
+    let lib = temp_dir("addform").unwrap();
+    let mut session = lightcraft_engine::Session::new().with_fs();
+    session.open_library(&lib, false).unwrap();
+    let app = LightcraftApp::new(session, Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
+
+    h.app.ui.dialog = Some(Dialog::Settings { tab: "integrations".into() });
+    h.settle(SETTLE);
+    // Add with empty fields does nothing (the button is disabled)
+    let r = h.request("ui.clickWidget", json!({"id": "button:immichSettingsAdd"}), T);
+    assert_eq!(r["ok"], true, "the button is on screen: {r}");
+    assert!(h.app.session.immich_servers.is_empty(), "nothing added from empty fields");
+    // fill the form — the fields live in egui memory, exactly where the UI keeps them
+    h.view.ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::new("immich-settings-url"), base.clone());
+        d.insert_temp(egui::Id::new("immich-settings-key"), "k".to_string());
+    });
+    h.settle(SETTLE);
+    let r = h.request("ui.clickWidget", json!({"id": "button:immichSettingsAdd"}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(h.app.session.immich_servers.len(), 1, "the server was added");
+    assert_eq!(h.app.session.immich_servers[0].url, base);
+    assert!(!h.app.session.immich_servers[0].verified, "a fresh server still needs its test");
+    h.settle(SETTLE);
+    let _ = std::fs::remove_dir_all(&lib);
 }

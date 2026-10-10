@@ -18,13 +18,15 @@ use super::{CommandSpec, always, bad, cmd, str_param};
 use crate::{EngineError, Result, Session};
 
 /// One Immich server the user configured: where it is, what to call it, and the key they created
-/// in Immich's Settings ▸ API keys.
+/// in Immich's Settings ▸ API keys. `verified` is set when a test reached the server and it
+/// answered — the UI keeps File ▸ Import from Immich disabled until some server has it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ImmichServer {
     pub name: String,
     pub url: String,
     pub api_key: String,
+    pub verified: bool,
 }
 
 /// The Immich part of prefs.json.
@@ -65,6 +67,7 @@ impl ImmichServer {
             "url": self.url,
             "insecure": !self.url.starts_with("https://"),
             "key": if self.api_key.is_empty() { "missing" } else { "set" },
+            "verified": self.verified,
         })
     }
 }
@@ -90,7 +93,8 @@ fn servers(s: &mut Session, p: &Value) -> Result<Value> {
             Some(_) => return Err(bad(CID, "`name` is too long")),
             None => host_of(&url),
         };
-        let entry = ImmichServer { name, url, api_key: key };
+        // a fresh entry is unverified — File ▸ Import from Immich unlocks only after a Test
+        let entry = ImmichServer { name, url, api_key: key, verified: false };
         match s.immich_servers.iter_mut().find(|x| ImmichServer::normalise(&x.url) == ImmichServer::normalise(&entry.url)) {
             Some(existing) => *existing = entry,
             None => {
@@ -160,14 +164,47 @@ fn date_param(p: &Value, key: &str, cid: &'static str) -> Result<Option<String>>
 }
 
 /// Is the Immich server up, and what does it report? The settings dialog's "Test" button.
+/// A passing test marks the server verified (File ▸ Import from Immich needs one that is).
 #[cfg(not(target_arch = "wasm32"))]
 fn test(s: &mut Session, p: &Value) -> Result<Value> {
     const CID: &str = "immich.test";
-    let srv = server_of(s, p, CID)?;
-    let c = lightcraft_immich::Client::new(&srv.url, &srv.api_key, Default::default()).map_err(net(CID))?;
+    let (url, key) = {
+        let srv = server_of(s, p, CID)?;
+        (srv.url.clone(), srv.api_key.clone())
+    };
+    let c = lightcraft_immich::Client::new(&url, &key, Default::default()).map_err(net(CID))?;
     let pong = c.ping().map_err(net(CID))?;
     let version = c.version().map_err(net(CID))?;
+    mark_verified(s, &url);
+    s.save_prefs()?;
     Ok(json!({ "ok": true, "pong": pong, "version": version.to_string() }))
+}
+
+/// Record that `server` passed a test. The UI runs its tests on a worker thread (the UI thread
+/// never waits for the network), so it calls this with the answer; `immich.test` calls it itself.
+/// No network happens here — the claim is only as good as the test that made it.
+fn verify(s: &mut Session, p: &Value) -> Result<Value> {
+    const CID: &str = "immich.verify";
+    let sel = str_param(p, "server").unwrap_or("").trim().to_string();
+    if sel.is_empty() {
+        return Err(bad(CID, "`server` is the name or URL of a configured Immich server"));
+    }
+    let url = s.immich_servers.iter().find(|x| x.matches(&sel)).map(|x| x.url.clone()).ok_or_else(|| {
+        let names: Vec<&str> = s.immich_servers.iter().map(|x| x.name.as_str()).collect();
+        bad(CID, format!("unknown Immich server `{sel}` (configured: {})", names.join(", ")))
+    })?;
+    mark_verified(s, &url);
+    s.save_prefs()?;
+    Ok(current(s))
+}
+
+/// Flag every entry with this URL as verified (there is at most one — `add` replaces by URL).
+fn mark_verified(s: &mut Session, url: &str) {
+    for x in &mut s.immich_servers {
+        if ImmichServer::normalise(&x.url) == ImmichServer::normalise(url) {
+            x.verified = true;
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -346,15 +383,26 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    let mut v = vec![cmd!(
-        query "immich.servers",
-        "Immich Servers",
-        [],
-        None,
-        "{add?: {url, apiKey, name?}, remove?: {name|url}} — the self-hosted Immich servers this library talks to; keys live in prefs.json unencrypted (the file is 0600) and are never echoed → {servers: [{name, url, insecure, key}]}",
-        always,
-        servers
-    )];
+    let mut v = vec![
+        cmd!(
+            query "immich.servers",
+            "Immich Servers",
+            [],
+            None,
+            "{add?: {url, apiKey, name?}, remove?: {name|url}} — the self-hosted Immich servers this library talks to; keys live in prefs.json unencrypted (the file is 0600) and are never echoed. A new or re-added server starts unverified → {servers: [{name, url, insecure, key, verified}]}",
+            always,
+            servers
+        ),
+        cmd!(
+            query "immich.verify",
+            "Verify Immich Server",
+            [],
+            None,
+            "{server} — record that the server passed a test (the UI tests on a worker thread and calls this with the answer; immich.test marks it itself). No network: the claim is only as good as the test behind it → {servers}",
+            always,
+            verify
+        ),
+    ];
     #[cfg(not(target_arch = "wasm32"))]
     {
         v.push(cmd!(

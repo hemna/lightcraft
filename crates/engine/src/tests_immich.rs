@@ -152,6 +152,39 @@ fn servers_are_configured_without_ever_echoing_the_key() {
 }
 
 #[test]
+fn a_passing_test_marks_the_server_verified_and_readding_resets_it() {
+    let lib = temp_dir("verify");
+    let (base, _seen, _h) = start(vec![reply_json(200, r#"{"res":"pong"}"#), reply_json(200, r#"{"major":1,"minor":135,"patch":3}"#)]);
+    let mut s = Session::new().with_fs();
+    s.open_library(&lib, false).unwrap();
+    add_server(&mut s, &base);
+    assert!(!s.immich_servers[0].verified, "a fresh server is not verified");
+    let r = s.execute("immich.test", &json!({})).unwrap();
+    assert_eq!(r["version"], "1.135.3", "{r}");
+    assert!(s.immich_servers[0].verified, "a passing test verifies the server");
+    assert!(std::fs::read_to_string(lib.join("prefs.json")).unwrap().contains("\"verified\": true"), "the flag is persisted");
+    // re-adding the same url replaces the entry — a changed key or URL needs a new test
+    let r = s.execute("immich.servers", &json!({"add": {"url": base, "apiKey": "k2", "name": "Home"}})).unwrap();
+    assert_eq!(r["servers"].as_array().map(Vec::len), Some(1), "{r}");
+    assert!(!s.immich_servers[0].verified, "a re-added server starts unverified");
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
+#[test]
+fn verify_records_a_passed_test_without_touching_the_network() {
+    // nothing listens on port 9 — `verify` only records a result, it must not dial anything
+    let mut s = Session::new().with_fs();
+    add_server(&mut s, "http://127.0.0.1:9");
+    let r = s.execute("immich.verify", &json!({"server": "Home"})).unwrap();
+    assert_eq!(r["servers"][0]["verified"], true, "{r}");
+    assert!(s.immich_servers[0].verified);
+    let e = s.execute("immich.verify", &json!({"server": "Nope"})).unwrap_err().to_string();
+    assert!(e.contains("unknown Immich server"), "{e}");
+    let e = s.execute("immich.verify", &json!({})).unwrap_err().to_string();
+    assert!(e.contains("`server`"), "{e}");
+}
+
+#[test]
 fn browse_resolves_the_album_by_name_and_maps_the_page() {
     let (base, seen, h) = start(vec![
         reply_json(200, r#"[{"id":"al1","albumName":"Trip","assetCount":2}]"#),

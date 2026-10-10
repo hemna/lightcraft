@@ -645,7 +645,8 @@ pub enum Dialog {
     Merge {
         opts: crate::merge::MergeDialog,
     },
-    /// Settings (preferences): `tab` = general | import | performance | interface.
+    /// Settings (preferences): `tab` = general | import | performance | interface | integrations
+    /// | faces | denoise.
     Settings {
         tab: String,
     },

@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -201,7 +202,7 @@ pub struct ImmichTask {
     rx: Receiver<Event>,
     tx: Sender<Event>,
     /// The server's albums.
-    albums: Vec<AlbumRow>,
+    pub albums: Vec<AlbumRow>,
     albums_busy: bool,
     /// A search is in flight.
     searching: bool,
@@ -290,7 +291,7 @@ impl ImmichTask {
 fn server_url_key(session: &lightcraft_engine::Session, sel: &str) -> Result<(String, String), String> {
     let list = &session.immich_servers;
     if list.is_empty() {
-        return Err("no Immich server is configured — add one with immich.servers {add: {url, apiKey}}".into());
+        return Err("no Immich server is configured yet — add and test one in Settings ▸ Integrations".into());
     }
     let sel = sel.trim();
     let found = if sel.is_empty() {
@@ -509,6 +510,10 @@ fn finish_import(app: &mut LightcraftApp, task: &mut ImmichTask) {
     }
 }
 
+/// Distinguishes staging folders inside one process (parallel tests, a reopen): one dialog's
+/// close must not purge another's in-flight downloads.
+static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Open the dialog (File ▸ Import from Immich…). A running import is stopped first; the dialog
 /// opens fresh.
 pub fn open(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
@@ -521,7 +526,7 @@ pub fn open(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
         wanted
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let staging = std::env::temp_dir().join(format!("lc-immich-ui-{}", std::process::id()));
+    let staging = std::env::temp_dir().join(format!("lc-immich-ui-{}-{}", std::process::id(), TASK_SEQ.fetch_add(1, Ordering::Relaxed)));
     let (url, key) = server_url_key(&app.session, &server).unwrap_or_default();
     app.immich_task = Some(ImmichTask {
         generation: Arc::new(AtomicU64::new(1)),
@@ -624,12 +629,14 @@ pub fn start_import(app: &mut LightcraftApp, d: &ImmichDialog) -> Result<Value, 
 /// Advance the Immich dialog (called every frame): start the jobs the dialog asked for, apply
 /// what its workers brought back, and commit finished download batches to the catalog.
 pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
+    // a settings-tab Test that finished while nobody was looking gets its verify here
+    verify_fresh_settings_tests(app, ctx);
     let Some(mut task) = app.immich_task.take() else { return };
     // the Test and Cancel buttons ask for these; the work happens here, not in the paint pass
-    if TEST_REQUEST.swap(false, Ordering::Relaxed) && !task.server_url.is_empty() {
+    if take_flag(ctx, TEST_FLAG) && !task.server_url.is_empty() {
         start_test(&task, ctx);
     }
-    if CANCEL_REQUEST.swap(false, Ordering::Relaxed) {
+    if take_flag(ctx, CANCEL_FLAG) {
         task.cancelled = true;
         if let Some(run) = &task.import {
             run.client.set_cancelled(true);
@@ -670,7 +677,16 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
             Event::Test { generation, result } => {
                 if generation == task.generation.load(Ordering::Relaxed) {
                     match result {
-                        Ok(v) => set_dialog_lines(app, None, Some(v)),
+                        Ok(v) => {
+                            set_dialog_lines(app, None, Some(v));
+                            // a passing test is what unlocks Import from Immich for this server
+                            if let Some(Dialog::Immich { opts }) = &app.ui.dialog {
+                                let name = opts.server.clone();
+                                if !name.is_empty() {
+                                    let _ = app.run("immich.verify", json!({ "server": name }));
+                                }
+                            }
+                        }
                         Err(e) => set_dialog_lines(app, Some(e), None),
                     }
                 }
@@ -761,14 +777,14 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImmichDialog) {
     let (srv_url, _) = server_url_key(&app.session, &d.server).unwrap_or_default();
 
     if servers.is_empty() {
-        ui.label(egui::RichText::new(crate::i18n::tr("No Immich server is configured. Add one with the command:")).color(t.text_label));
-        ui.label(egui::RichText::new("immich.servers {add: {url, apiKey, name?}}").monospace().color(t.text_dim));
+        ui.label(egui::RichText::new(crate::i18n::tr("No Immich server is configured yet.")).color(t.text_label));
         ui.label(
-            egui::RichText::new(crate::i18n::tr("Create the key in Immich under Settings ▸ API keys, add the server, and reopen this dialog."))
-                .color(t.text_dim)
-                .small(),
+            egui::RichText::new(crate::i18n::tr(
+                "Add your server in Settings ▸ Integrations, then Test it — File ▸ Import from Immich unlocks once it answers.",
+            ))
+            .color(t.text_dim)
+            .small(),
         );
-        test_button(ui, &srv_url);
         return;
     }
 
@@ -943,12 +959,29 @@ fn test_button(ui: &mut egui::Ui, url: &str) {
     let r = ui.add_enabled(!url.is_empty(), egui::Button::new(crate::i18n::tr("Test")));
     register(ui.ctx(), "button:immichTest", r.rect);
     if r.clicked() {
-        TEST_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        request_flag(ui.ctx(), TEST_FLAG);
     }
 }
 
-/// Set by the Test button, consumed by [`tick`] (which owns the task).
-static TEST_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set a button's request flag (egui memory, so it belongs to this app — a second app in the
+/// same process, like a parallel test, never sees it).
+fn request_flag(ctx: &egui::Context, flag: &str) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(flag), true));
+}
+
+/// Read and clear a request flag.
+fn take_flag(ctx: &egui::Context, flag: &str) -> bool {
+    let id = egui::Id::new(flag);
+    let v = ctx.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    if v {
+        ctx.data_mut(|d| d.insert_temp(id, false));
+    }
+    v
+}
+
+/// The Test and Cancel buttons set these; [`tick`] (which owns the task) takes them.
+const TEST_FLAG: &str = "immich-test-requested";
+const CANCEL_FLAG: &str = "immich-cancel-requested";
 
 /// The import phase of the dialog: the progress bar, the failures, and Cancel.
 fn import_progress(app: &mut LightcraftApp, ui: &mut egui::Ui) {
@@ -980,13 +1013,10 @@ fn import_progress(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         let r = ui.add_enabled(!task.cancelled, egui::Button::new(crate::i18n::tr("Cancel")));
         register(ui.ctx(), "button:immichCancel", r.rect);
         if r.clicked() {
-            CANCEL_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
+            request_flag(ui.ctx(), CANCEL_FLAG);
         }
     }
 }
-
-/// Set by the in-dialog Cancel button, consumed by [`tick`] (which owns the task).
-static CANCEL_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The browsed assets as a selectable grid of thumbnails (fetched on workers, bounded in flight;
 /// the grid only asks for the cells in view).
@@ -1059,6 +1089,179 @@ fn asset_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImmichDialog, 
     if resp.clicked() {
         let shift = ui.input(|input| input.modifiers.shift);
         d.click(i, shift);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings ▸ Integrations
+// ---------------------------------------------------------------------------
+
+/// One Test outcome from the Integrations tab: written by the worker thread, read every frame.
+#[derive(Clone, Debug)]
+struct SettingsTest {
+    /// The test is still running.
+    pending: bool,
+    /// A success (the server's version) or the failure's error line.
+    ok: bool,
+    message: String,
+    /// A success whose `immich.verify` has not run yet — the first [`tick`] after it runs it.
+    fresh: bool,
+}
+
+/// The tab's test outcomes, in egui memory so they live as long as the app (never on disk).
+fn settings_tests(ctx: &egui::Context) -> Option<Arc<Mutex<HashMap<String, SettingsTest>>>> {
+    ctx.data(|d| d.get_temp::<Arc<Mutex<HashMap<String, SettingsTest>>>>(egui::Id::new("immich-settings-tests")))
+}
+
+/// Settings ▸ Integrations: the Immich servers — add one, test it, remove it. A server that
+/// passed a test unlocks File ▸ Import from Immich; a new or re-added server starts locked.
+pub fn settings_tab(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    use crate::panels::settings::{heading, hint, row};
+
+    heading(ui, t, "Immich");
+    hint(
+        ui,
+        t,
+        "Import from a self-hosted Immich server (File ▸ Import from Immich…). Add your server and Test it — the menu item unlocks once the test passes.",
+    );
+
+    let tests = {
+        let id = egui::Id::new("immich-settings-tests");
+        let tests = ui.data(|d| d.get_temp::<Arc<Mutex<HashMap<String, SettingsTest>>>>(id)).unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        ui.data_mut(|d| d.insert_temp(id, tests.clone()));
+        tests
+    };
+    let servers: Vec<(String, String, String, bool)> =
+        app.session.immich_servers.iter().map(|s| (s.name.clone(), s.url.clone(), s.api_key.clone(), s.verified)).collect();
+    let snapshot: HashMap<String, SettingsTest> = tests.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    let mut run_test: Option<(String, String, String)> = None; // (name, url, key)
+    let mut remove: Option<String> = None;
+    for (name, url, key, verified) in &servers {
+        let state = snapshot.get(name);
+        let status = match state {
+            Some(s) if s.pending => crate::i18n::tr("Testing…").to_string(),
+            Some(s) => s.message.clone(),
+            None if *verified => crate::i18n::tr("Tested — ready").to_string(),
+            None => crate::i18n::tr("Not tested yet").to_string(),
+        };
+        let pending = state.is_some_and(|s| s.pending);
+        let ok = state.map(|s| s.ok).unwrap_or(*verified);
+        row(ui, t, name, |ui| {
+            ui.label(egui::RichText::new(url.as_str()).color(t.text_dim));
+            let r = ui.label(egui::RichText::new(status).color(if ok { t.text_dim } else { t.caution }));
+            register(ui.ctx(), format!("label:immichSettingsStatus-{name}"), r.rect);
+            let r = ui.add_enabled(!pending, egui::Button::new(crate::i18n::tr("Test")));
+            register(ui.ctx(), format!("button:immichSettingsTest-{name}"), r.rect);
+            if r.clicked() {
+                run_test = Some((name.clone(), url.clone(), key.clone()));
+            }
+            let r = ui.add(egui::Button::new(crate::i18n::tr("Remove")));
+            register(ui.ctx(), format!("button:immichSettingsRemove-{name}"), r.rect);
+            if r.clicked() {
+                remove = Some(name.clone());
+            }
+        });
+    }
+
+    // the add form: the address and the key the user created in Immich (never shown, never saved
+    // anywhere but the engine's prefs once Add succeeds)
+    let (url_id, key_id) = (egui::Id::new("immich-settings-url"), egui::Id::new("immich-settings-key"));
+    let mut add_url = ui.data(|d| d.get_temp::<String>(url_id)).unwrap_or_default();
+    let mut add_key = ui.data(|d| d.get_temp::<String>(key_id)).unwrap_or_default();
+    let mut add_clicked = false;
+    heading(ui, t, "Add a server");
+    hint(ui, t, "Create the key in Immich under Settings ▸ API keys.");
+    row(ui, t, "Server address", |ui| {
+        let r = ui.add(egui::TextEdit::singleline(&mut add_url).hint_text("https://photos.example.com:2283").desired_width(300.0));
+        register(ui.ctx(), "field:immichSettingsUrl", r.rect);
+    });
+    row(ui, t, "API key", |ui| {
+        let r = ui.add(egui::TextEdit::singleline(&mut add_key).password(true).desired_width(300.0));
+        register(ui.ctx(), "field:immichSettingsKey", r.rect);
+    });
+    row(ui, t, "", |ui| {
+        let ready = !add_url.trim().is_empty() && !add_key.trim().is_empty();
+        let r = ui.add_enabled(ready, egui::Button::new(crate::i18n::tr("Add server")));
+        register(ui.ctx(), "button:immichSettingsAdd", r.rect);
+        add_clicked = r.clicked();
+    });
+
+    if let Some((name, url, key)) = run_test {
+        tests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.clone(), SettingsTest { pending: true, ok: false, message: String::new(), fresh: false });
+        let (ctx, tests2, name2) = (ui.ctx().clone(), tests.clone(), name.clone());
+        let spawned = spawn("lc-immich-settings-test", &ctx, move || {
+            let r: Result<String, String> = lightcraft_engine::guard::catch("immich settings test", || {
+                let c = Client::new(&url, &key, Limits::default()).map_err(|e| e.to_string())?;
+                let pong = c.ping().map_err(|e| e.to_string())?;
+                let v = c.version().map_err(|e| e.to_string())?;
+                Ok(format!("{pong} — Immich {v}"))
+            })
+            .flatten();
+            let (ok, message) = match r {
+                Ok(m) => (true, m),
+                Err(e) => (false, e),
+            };
+            tests2.lock().unwrap_or_else(|e| e.into_inner()).insert(name2, SettingsTest { pending: false, ok, message, fresh: ok });
+        });
+        if let Err(e) = spawned {
+            tests.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
+            settings_message(ui, false, e);
+        }
+    }
+    if let Some(name) = remove {
+        match app.run("immich.servers", json!({ "remove": { "name": name } })) {
+            Ok(_) => {
+                tests.lock().unwrap_or_else(|e| e.into_inner()).remove(&name);
+                settings_message(ui, true, crate::i18n::tr("Removed.").to_string());
+            }
+            Err(e) => settings_message(ui, false, e),
+        }
+    }
+    if add_clicked {
+        match app.run("immich.servers", json!({ "add": { "url": add_url.trim(), "apiKey": add_key.trim() } })) {
+            Ok(_) => {
+                add_url.clear();
+                add_key.clear();
+                settings_message(ui, true, crate::i18n::tr("Added. Test it to unlock Import from Immich.").to_string());
+            }
+            Err(e) => settings_message(ui, false, e),
+        }
+    }
+    ui.data_mut(|d| {
+        d.insert_temp(url_id, add_url);
+        d.insert_temp(key_id, add_key);
+    });
+    if let Some((ok, text)) = ui.data(|d| d.get_temp::<Option<(bool, String)>>(egui::Id::new("immich-settings-msg"))).flatten() {
+        let r = ui.label(egui::RichText::new(text).color(if ok { t.text_dim } else { t.caution }));
+        register(ui.ctx(), "label:immichSettingsMessage", r.rect);
+    }
+}
+
+/// The tab's status line (the last action's outcome), in egui memory.
+fn settings_message(ui: &mut egui::Ui, ok: bool, text: String) {
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("immich-settings-msg"), Some((ok, text))));
+}
+
+/// A settings-tab Test that finished successfully gets its `immich.verify` here — every frame,
+/// so the menu unlocks even if the user closed Settings while the test was running.
+fn verify_fresh_settings_tests(app: &mut LightcraftApp, ctx: &egui::Context) {
+    let Some(tests) = settings_tests(ctx) else { return };
+    let mut to_verify: Vec<String> = Vec::new();
+    {
+        let mut map = tests.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, test) in map.iter_mut() {
+            if test.ok && test.fresh && !test.pending {
+                to_verify.push(name.clone());
+                test.fresh = false;
+            }
+        }
+    }
+    for name in to_verify {
+        let _ = app.run("immich.verify", json!({ "server": name }));
     }
 }
 
