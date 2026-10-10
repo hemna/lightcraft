@@ -1,4 +1,4 @@
-use crate::http::HttpError;
+use lightcraft_fetch::http::HttpError;
 
 /// Why an Immich call failed. Every variant is something the user can act on, and none of them
 /// carries the API key.

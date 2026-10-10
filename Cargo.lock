@@ -3205,12 +3205,10 @@ dependencies = [
 name = "lightcraft-immich"
 version = "0.5.0"
 dependencies = [
+ "lightcraft-fetch",
  "log",
- "rustls",
- "rustls-rustcrypto",
  "serde",
  "serde_json",
- "webpki-roots",
 ]
 
 [[package]]

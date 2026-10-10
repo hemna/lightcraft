@@ -1,6 +1,6 @@
-//! The calls v1 needs, in terms of [`crate::http`]: ping, version, paged search, albums, download,
-//! upload, stack. Every path is built from the user's base URL, so a server on a LAN address, on a
-//! Tailscale name or behind a reverse-proxied prefix is the same code.
+//! The calls v1 needs, in terms of [`lightcraft_fetch::http`]: ping, version, paged search,
+//! albums, download. Every path is built from the user's base URL, so a server on a LAN address,
+//! on a Tailscale name or behind a reverse-proxied prefix is the same code.
 //!
 //! Responses deserialize into `Option`-heavy, unknown-field-tolerant structs: an older or newer 3.x
 //! server that omits (or adds) a field is a `None`, never a decode failure. A JSON answer we cannot
@@ -13,8 +13,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::http::{self, Limits as HttpLimits, Response, Url};
-use crate::multipart::{self, Part};
+use lightcraft_fetch::http::{self, Limits as HttpLimits, Response, Url};
 
 /// Timeouts and caps for every call made through one [`Client`].
 #[derive(Clone, Debug)]
@@ -27,8 +26,6 @@ pub struct Limits {
     pub max_download: u64,
     /// Cap on one downloaded thumbnail (a screen-sized JPEG is far under this).
     pub max_thumb: u64,
-    /// Cap on one uploaded derivative.
-    pub max_upload: u64,
 }
 
 impl Default for Limits {
@@ -39,7 +36,6 @@ impl Default for Limits {
             max_json: 8 * 1024 * 1024,
             max_download: 4 * 1024 * 1024 * 1024,
             max_thumb: 32 * 1024 * 1024,
-            max_upload: 256 * 1024 * 1024,
         }
     }
 }
@@ -429,76 +425,6 @@ impl Client {
             done = next;
             progress(done);
         }
-    }
-
-    /// `POST /assets`: upload a derivative, with its XMP sidecar when there is one. Immich has no
-    /// endpoint that replaces an existing asset's bytes, so republishing uploads a new asset.
-    pub fn upload_asset(
-        &self,
-        bytes: &[u8],
-        file_name: &str,
-        content_type: &str,
-        sidecar: Option<&[u8]>,
-        created_at: Option<&str>,
-        is_favorite: bool,
-    ) -> Result<Asset, Error> {
-        if bytes.is_empty() {
-            return Err(Error::Limit("refusing to upload an empty file".to_string()));
-        }
-        if bytes.len() as u64 > self.limits.max_upload {
-            return Err(Error::Limit(format!("{} bytes is over the {}-byte upload limit", bytes.len(), self.limits.max_upload)));
-        }
-        let mut options = serde_json::Map::new();
-        if let Some(d) = created_at {
-            options.insert("fileCreatedAt".into(), serde_json::json!(d));
-        }
-        options.insert("isFavorite".into(), serde_json::json!(is_favorite));
-        let options = serde_json::to_vec(&serde_json::Value::Object(options)).map_err(|e| Error::Api { status: 0, message: e.to_string() })?;
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64 ^ (bytes.len() as u64) << 32)
-            .unwrap_or(0x5eed);
-        let bound = multipart::boundary(seed);
-        let sidecar_name = format!("{file_name}.xmp");
-        let mut parts: Vec<Part<'_>> = vec![Part { name: "file", filename: Some(file_name), content_type: Some(content_type), data: bytes }];
-        if let Some(x) = sidecar {
-            parts.push(Part { name: "sidecarData", filename: Some(&sidecar_name), content_type: Some("application/xml"), data: x });
-        }
-        parts.push(Part { name: "options", filename: None, content_type: Some("application/json"), data: &options });
-        let body = multipart::encode(&bound, &parts).map_err(Error::Limit)?;
-        let ct = format!("multipart/form-data; boundary={bound}");
-        let mut resp = self.send("POST", "/assets", Some(&body), Some(&ct))?;
-        self.json(&mut resp)
-    }
-
-    /// `POST /albums` — create a publish target's album.
-    pub fn create_album(&self, name: &str) -> Result<Album, Error> {
-        if name.trim().is_empty() || name.chars().count() > 500 {
-            return Err(Error::Api { status: 0, message: "an album name is needed".to_string() });
-        }
-        let body = serde_json::to_vec(&serde_json::json!({ "albumName": name })).map_err(|e| Error::Api { status: 0, message: e.to_string() })?;
-        let mut resp = self.send("POST", "/albums", Some(&body), Some("application/json"))?;
-        self.json(&mut resp)
-    }
-
-    /// `PUT /albums/{id}/assets` — put derivatives into the album.
-    pub fn add_to_album(&self, album_id: &str, asset_ids: &[String]) -> Result<(), Error> {
-        if asset_ids.is_empty() {
-            return Ok(());
-        }
-        let body = serde_json::to_vec(&serde_json::json!({ "ids": asset_ids })).map_err(|e| Error::Api { status: 0, message: e.to_string() })?;
-        self.send("PUT", &format!("/albums/{}/assets", encode_segment(album_id)), Some(&body), Some("application/json"))?;
-        Ok(())
-    }
-
-    /// `POST /stacks` — group a derivative under its original so the server shows one item.
-    pub fn create_stack(&self, primary_id: &str, child_ids: &[String]) -> Result<String, Error> {
-        let mut ids = vec![primary_id.to_string()];
-        ids.extend(child_ids.iter().cloned());
-        let body = serde_json::to_vec(&serde_json::json!({ "assetIds": ids })).map_err(|e| Error::Api { status: 0, message: e.to_string() })?;
-        let mut resp = self.send("POST", "/stacks", Some(&body), Some("application/json"))?;
-        let v: serde_json::Value = self.json(&mut resp)?;
-        Ok(v.get("id").and_then(|i| i.as_str()).unwrap_or(primary_id).to_string())
     }
 }
 

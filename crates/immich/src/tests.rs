@@ -14,7 +14,6 @@ use crate::api::{Client, Limits, SearchQuery};
 use crate::error::Error;
 
 pub struct Captured {
-    pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -92,8 +91,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Captured> {
     let head = String::from_utf8_lossy(&buf[..head_len]).into_owned();
     let mut lines = head.lines();
     let mut first = lines.next().unwrap_or_default().split_whitespace();
-    let method = first.next().unwrap_or_default().to_string();
-    let path = first.next().unwrap_or_default().to_string();
+    let path = first.next().and_then(|_| first.next()).unwrap_or_default().to_string();
     let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))).collect();
     let declared = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-length")).and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(0);
     let mut body = buf[head_len..].to_vec();
@@ -104,7 +102,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Captured> {
         }
         body.extend_from_slice(&chunk[..n]);
     }
-    Some(Captured { method, path, headers, body })
+    Some(Captured { path, headers, body })
 }
 
 fn write_reply(stream: &mut TcpStream, r: &Reply) {
@@ -309,53 +307,7 @@ fn a_download_reports_progress_and_returns_its_bytes() {
     h.join().unwrap();
 }
 
-#[test]
-fn an_upload_is_multipart_with_file_sidecar_and_options() {
-    let (base, seen, h) = start(vec![json(200, r#"{"id":"new1","checksum":"cafe","originalFileName":"out.jpg","isFavorite":false}"#)]);
-    let client = Client::new(&base, "k", Limits::default()).unwrap();
-    let asset =
-        client.upload_asset(b"jpegbytes", "export/out.jpg", "image/jpeg", Some(b"<x:xmpmeta/>"), Some("2026-01-02T03:04:05.000Z"), true).unwrap();
-    let got = take(&seen);
-    h.join().unwrap();
-    assert_eq!(asset.id, "new1");
-    let req = got.first().unwrap();
-    assert_eq!(req.method, "POST");
-    assert_eq!(req.path, "/api/assets");
-    let ct = req.header("content-type");
-    assert!(ct.starts_with("multipart/form-data; boundary="), "{ct}");
-    let body = String::from_utf8_lossy(&req.body).into_owned();
-    assert!(body.contains("name=\"file\"; filename=\"export_out.jpg\""), "{body}");
-    assert!(body.contains("jpegbytes"));
-    assert!(body.contains("name=\"sidecarData\""));
-    assert!(body.contains("<x:xmpmeta/>"));
-    assert!(body.contains("name=\"options\""));
-    assert!(body.contains("\"fileCreatedAt\":\"2026-01-02T03:04:05.000Z\""));
-    assert!(body.contains("\"isFavorite\":true"));
-}
 
-#[test]
-fn album_and_stack_calls_put_their_json() {
-    let (base, seen, h) = start(vec![
-        json(201, r#"{"id":"alb1","albumName":"LightCraft","assetCount":0,"description":null}"#),
-        json(200, "{}"),
-        json(201, r#"{"id":"stack1","primaryAssetId":"p1"}"#),
-        json(200, r#"[{"id":"alb1","albumName":"LightCraft","assetCount":3},{"id":"alb2","albumName":"Other"}]"#),
-    ]);
-    let client = Client::new(&base, "k", Limits::default()).unwrap();
-    let album = client.create_album("LightCraft").unwrap();
-    assert_eq!((album.id.as_str(), album.album_name.as_str(), album.asset_count), ("alb1", "LightCraft", 0));
-    client.add_to_album("alb 1", &["x1".into(), "x2".into()]).unwrap();
-    let stack = client.create_stack("p1", &["c1".into()]).unwrap();
-    assert_eq!(stack, "stack1");
-    let albums = client.albums().unwrap();
-    assert_eq!(albums.len(), 2);
-    let got = take(&seen);
-    h.join().unwrap();
-    let paths: Vec<&str> = got.iter().map(|c| c.path.as_str()).collect();
-    assert_eq!(paths, vec!["/api/albums", "/api/albums/alb%201/assets", "/api/stacks", "/api/albums"]);
-    assert_eq!(got.get(1).unwrap().method, "PUT");
-    assert!(String::from_utf8_lossy(&got.get(1).unwrap().body).contains("\"x1\""));
-}
 
 #[test]
 fn an_unusable_configuration_is_an_error_not_a_panic() {
@@ -430,12 +382,9 @@ fn a_real_server_round_trip_when_one_is_configured() {
     let v = client.version().unwrap();
     assert!(v.major >= 1, "unexpected server version {v}");
     let albums = client.albums().unwrap();
-    let made = client.create_album(&format!("lightcraft-probe-{}", std::process::id())).unwrap();
-    let created = client.upload_asset(b"\xff\xd8\xff\xd9", &format!("probe-{}.jpg", std::process::id()), "image/jpeg", None, None, false).unwrap();
-    client.add_to_album(&made.id, std::slice::from_ref(&created.id)).unwrap();
-    assert!(!created.checksum.is_empty());
-    let mut sink = Vec::new();
-    client.download_original(&created.id, &mut sink, |_, _| {}).unwrap();
-    assert_eq!(sink, b"\xff\xd8\xff\xd9");
-    eprintln!("live server {v} answered: {} albums, asset {}", albums.len(), created.id);
+    // read-only: one album's page, when there is an album to read
+    if let Some(first) = albums.first() {
+        let _ = client.album_assets(&first.id).unwrap();
+    }
+    eprintln!("live server {v} answered: {} albums", albums.len());
 }

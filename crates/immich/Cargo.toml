@@ -10,11 +10,9 @@ license.workspace = true
 log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The same pure-Rust TLS stack as lightcraft-fetch: rustls with the RustCrypto provider (nothing
-# from C or assembly) and the webpki root set. Same declarations, so both crates resolve one copy.
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-rustls-rustcrypto = "0.0.2-alpha"
-webpki-roots = "1"
+# The pure-Rust HTTP/TLS client: rustls with the RustCrypto provider and the webpki root set,
+# shared with the model downloads (one copy of the whole stack).
+lightcraft-fetch = { workspace = true }
 
 [lints]
 workspace = true
