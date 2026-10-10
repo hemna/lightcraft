@@ -26,14 +26,22 @@ impl Captured {
     }
 }
 
+#[derive(Clone)]
 pub struct Reply {
     pub status: u16,
     pub content_type: &'static str,
     pub body: String,
+    /// A `Location` header, for redirect replies.
+    pub location: Option<String>,
 }
 
 pub fn json(status: u16, body: &str) -> Reply {
-    Reply { status, content_type: "application/json", body: body.to_string() }
+    Reply { status, content_type: "application/json", body: body.to_string(), location: None }
+}
+
+/// A redirect answer pointing at `location`.
+pub fn redirect(status: u16, location: &str) -> Reply {
+    Reply { status, content_type: "text/plain", body: String::new(), location: Some(location.to_string()) }
 }
 
 /// Serve `replies`, one per connection, and capture what arrived. The thread exits after that many
@@ -99,9 +107,10 @@ fn read_request(stream: &mut TcpStream) -> Option<Captured> {
 }
 
 fn write_reply(stream: &mut TcpStream, r: &Reply) {
+    let location = r.location.as_ref().map(|l| format!("Location: {l}\r\n")).unwrap_or_default();
     let _ = stream.write_all(
         format!(
-            "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {} X\r\nContent-Type: {}\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             r.status,
             r.content_type,
             r.body.len(),
@@ -161,6 +170,51 @@ fn a_version_answers_and_a_pong_is_a_string() {
 }
 
 #[test]
+fn a_same_host_redirect_is_followed_with_the_key() {
+    // a reverse proxy answers 308 and points somewhere else on the same host
+    let (base, seen, h) = start(vec![redirect(308, "/immich/api/server/ping"), json(200, r#"{"res":"pong"}"#)]);
+    let client = Client::new(&base, "s3cr3t", Limits::default()).unwrap();
+    assert_eq!(client.ping().unwrap(), "pong", "the redirect is followed to the answer");
+    let got = take(&seen);
+    h.join().unwrap();
+    assert_eq!(got.len(), 2, "two connections: the redirect, then the target");
+    assert_eq!(got[0].path, "/api/server/ping");
+    assert_eq!(got[1].path, "/immich/api/server/ping");
+    assert_eq!(got[1].header("x-api-key"), "s3cr3t", "the key travels to the same host");
+}
+
+#[test]
+fn a_redirect_to_another_host_is_refused() {
+    // the key must never travel to a host the user did not name
+    let (base, seen, h) = start(vec![redirect(302, "https://elsewhere.example/api/server/ping")]);
+    let client = Client::new(&base, "s3cr3t", Limits::default()).unwrap();
+    let e = client.ping().unwrap_err().to_string();
+    assert!(e.contains("different host") && e.contains("elsewhere.example"), "{e}");
+    let got = take(&seen);
+    h.join().unwrap();
+    assert_eq!(got.len(), 1, "nothing was sent to the other host");
+}
+
+#[test]
+fn a_redirect_loop_stops() {
+    // the client gives up after MAX_REDIRECTS follows: five connections, five replies
+    let (base, _seen, h) = start(vec![redirect(308, "/api/server/ping"); 5]);
+    let client = Client::new(&base, "k", Limits::default()).unwrap();
+    let e = client.ping().unwrap_err().to_string();
+    assert!(e.contains("keeps redirecting"), "{e}");
+    h.join().unwrap();
+}
+
+#[test]
+fn a_redirect_without_a_location_says_so() {
+    let (base, _seen, h) = start(vec![Reply { status: 308, content_type: "text/plain", body: String::new(), location: None }]);
+    let client = Client::new(&base, "k", Limits::default()).unwrap();
+    let e = client.ping().unwrap_err().to_string();
+    assert!(e.contains("redirect without a Location"), "{e}");
+    h.join().unwrap();
+}
+
+#[test]
 fn a_search_sends_our_filters_and_reads_camelcase_assets() {
     let (base, seen, h) = start(vec![
         json(
@@ -195,8 +249,8 @@ fn server_errors_become_actionable_errors() {
         json(500, r#"{"message":"machine learning is wedged"}"#),
         json(401, r#"{"message":"Invalid API key"}"#),
         json(404, "nothing here"),
-        Reply { status: 200, content_type: "application/json", body: "this is not json".into() },
-        Reply { status: 503, content_type: "text/html", body: "<html><body><h1>502 Bad Gateway</h1></body></html>".into() },
+        Reply { status: 200, content_type: "application/json", body: "this is not json".into(), location: None },
+        Reply { status: 503, content_type: "text/html", body: "<html><body><h1>502 Bad Gateway</h1></body></html>".into(), location: None },
     ]);
     let client = Client::new(&base, "k", Limits::default()).unwrap();
     let e = client.ping().unwrap_err();
@@ -322,7 +376,7 @@ fn the_extra_filters_travel_in_the_search_body() {
 fn an_asset_meta_and_a_thumbnail_use_the_asset_endpoints() {
     let (base, seen, h) = start(vec![
         json(200, r#"{"id":"a1","checksum":"beef","originalFileName":"IMG_2.HEIC","rating":3,"isFavorite":true}"#),
-        Reply { status: 200, content_type: "image/jpeg", body: "j".repeat(1000) },
+        Reply { status: 200, content_type: "image/jpeg", body: "j".repeat(1000), location: None },
     ]);
     let client = Client::new(&base, "k", Limits::default()).unwrap();
     let a = client.asset("a1").unwrap();
@@ -339,7 +393,7 @@ fn an_asset_meta_and_a_thumbnail_use_the_asset_endpoints() {
 
 #[test]
 fn a_thumbnail_over_the_cap_is_refused() {
-    let (base, _seen, h) = start(vec![Reply { status: 200, content_type: "image/jpeg", body: "j".repeat(5000) }]);
+    let (base, _seen, h) = start(vec![Reply { status: 200, content_type: "image/jpeg", body: "j".repeat(5000), location: None }]);
     let client = Client::new(&base, "k", Limits { max_thumb: 100, ..Limits::default() }).unwrap();
     let mut sink = Vec::new();
     let e = client.thumbnail("a1", "preview", &mut sink, |_| {}).unwrap_err();

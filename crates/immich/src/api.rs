@@ -182,6 +182,10 @@ pub struct Client {
     cancel: AtomicBool,
 }
 
+/// How many same-host redirects one call may follow (an added `/api`, a trailing slash, an
+/// http → https upgrade) before the server is asked to mean one address.
+const MAX_REDIRECTS: usize = 4;
+
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The key is never formatted, not even truncated.
@@ -239,9 +243,36 @@ impl Client {
     }
 
     fn send(&self, method: &str, rest: &str, body: Option<&[u8]>, content_type: Option<&str>) -> Result<Response, Error> {
-        let url = self.url(rest);
-        let mut resp = http::request(method, &url, &self.headers(content_type), body, &self.limits())?;
-        if (200..300).contains(&resp.status) { Ok(resp) } else { Err(self.error_from(&mut resp, rest)) }
+        let mut url = self.url(rest);
+        let mut redirects = 0;
+        loop {
+            let mut resp = http::request(method, &url, &self.headers(content_type), body, &self.limits())?;
+            // A proxied Immich often answers with a redirect: an added /api prefix, a missing
+            // trailing slash, http → https. Follow it — same host only, so the API key never
+            // travels to a server the user did not name.
+            let location = match resp.status {
+                301 | 302 | 303 | 307 | 308 => resp.header("location").map(str::to_string),
+                _ => None,
+            };
+            let Some(location) = location else {
+                if (200..300).contains(&resp.status) {
+                    return Ok(resp);
+                }
+                return Err(self.error_from(&mut resp, rest));
+            };
+            if redirects >= MAX_REDIRECTS {
+                return Err(Error::Api { status: resp.status, message: "the server keeps redirecting — add it with its final address".into() });
+            }
+            redirects += 1;
+            let next = url.join(&location)?;
+            if next.host != url.host {
+                return Err(Error::Api {
+                    status: resp.status,
+                    message: format!("the server redirected to {location}, a different host — add the server with its final address instead"),
+                });
+            }
+            url = next;
+        }
     }
 
     /// Turn a non-2xx answer into an error, quoting the server's own message when it sent one.
@@ -257,6 +288,7 @@ impl Client {
             .and_then(|v| ["message", "error", "detail"].iter().find_map(|k| v.get(*k).and_then(|m| m.as_str()).map(str::to_string)));
         let message = quoted
             .or_else(|| if is_message(&text) { Some(text.trim().to_string()) } else { None })
+            .or_else(|| (300..400).contains(&status).then(|| "a redirect without a Location header — check the server address".to_string()))
             .unwrap_or_else(|| "the server gave no explanation".to_string());
         match status {
             401 | 403 => Error::Unauthorized,
