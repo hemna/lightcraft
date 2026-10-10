@@ -290,7 +290,7 @@ fn a_download_over_the_cap_is_refused_before_it_runs() {
     let (base, _seen, h) = start(vec![json(200, &"x".repeat(4000))]);
     let client = Client::new(&base, "k", limits(100)).unwrap();
     let mut sink = Vec::new();
-    let e = client.download_original("a1", &mut sink, |_| {}).unwrap_err();
+    let e = client.download_original("a1", &mut sink, |_, _| {}).unwrap_err();
     assert!(matches!(e, Error::Limit(_)), "{e:?}");
     assert!(sink.is_empty());
     h.join().unwrap();
@@ -302,7 +302,7 @@ fn a_download_reports_progress_and_returns_its_bytes() {
     let client = Client::new(&base, "k", Limits::default()).unwrap();
     let mut sink = Vec::new();
     let mut last = 0;
-    let n = client.download_original("a1", &mut sink, |done| last = done).unwrap();
+    let n = client.download_original("a1", &mut sink, |done, _total| last = done).unwrap();
     assert_eq!(n, 300_000);
     assert_eq!(sink.len(), 300_000);
     assert_eq!(last, 300_000);
@@ -435,7 +435,7 @@ fn a_real_server_round_trip_when_one_is_configured() {
     client.add_to_album(&made.id, std::slice::from_ref(&created.id)).unwrap();
     assert!(!created.checksum.is_empty());
     let mut sink = Vec::new();
-    client.download_original(&created.id, &mut sink, |_| {}).unwrap();
+    client.download_original(&created.id, &mut sink, |_, _| {}).unwrap();
     assert_eq!(sink, b"\xff\xd8\xff\xd9");
     eprintln!("live server {v} answered: {} albums, asset {}", albums.len(), created.id);
 }

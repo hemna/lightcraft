@@ -374,13 +374,15 @@ impl Client {
     }
 
     /// `GET /assets/{id}/original` into `out`, at most `max_download` bytes, reporting bytes so far
-    /// to `progress`. Returns the number of bytes written.
-    pub fn download_original<W: Write>(&self, asset_id: &str, out: &mut W, mut progress: impl FnMut(u64)) -> Result<u64, Error> {
+    /// and the announced total (0 when the server did not say) to `progress`. Returns the number
+    /// of bytes written.
+    pub fn download_original<W: Write>(&self, asset_id: &str, out: &mut W, mut progress: impl FnMut(u64, u64)) -> Result<u64, Error> {
         let rest = format!("/assets/{}/original", encode_segment(asset_id));
         let mut resp = self.send("GET", &rest, None, None)?;
         if let Some(n) = resp.content_length().filter(|n| *n > self.limits.max_download) {
             return Err(Error::Limit(format!("this photo is {n} bytes, over the {}-byte limit", self.limits.max_download)));
         }
+        let total = resp.content_length().unwrap_or(0);
         let mut done: u64 = 0;
         let mut buf = [0u8; 128 * 1024];
         loop {
@@ -394,7 +396,7 @@ impl Client {
             }
             out.write_all(buf.get(..n).unwrap_or_default()).map_err(|e| Error::Transport(format!("could not write the download: {e}")))?;
             done = next;
-            progress(done);
+            progress(done, total);
         }
     }
 

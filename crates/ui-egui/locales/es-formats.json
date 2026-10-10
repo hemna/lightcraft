@@ -24,6 +24,7 @@
   "Added {n} photo{} to “{}”": "{n} foto{0} añadida{0} a “{1}”",
   "Added {what} to {name}": "{what} añadido a {name}",
   "Adding photos… {} of {}": "Añadiendo fotos… {} de {}",
+  "Added {} photo{} from Immich.": "Se añadieron {} foto{} de Immich.",
   "All {n} selected photos move by the same amount.": "Las {n} fotos seleccionadas se desplazan la misma cantidad.",
   "Already in the library, in Recently Deleted: {} photo{} selected · right-click ▸ Restore, or Delete Permanently to import afresh": "Ya en la biblioteca, en Eliminadas recientemente: {0} foto{1} seleccionada{1} · clic derecho → Restaurar, o Eliminar definitivamente para importar de nuevo",
   "Already in the library: {} photo{} selected in All Photos": "Ya en la biblioteca: {0} foto{1} seleccionada{1} en Todas las fotos",

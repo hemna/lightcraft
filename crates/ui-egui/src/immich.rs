@@ -190,9 +190,44 @@ enum Event {
 
 /// An import run: its client (whose cancel flag the Cancel button raises) and whether its worker
 /// has been spawned yet (the first [`tick`] after the button does that, with a real context).
-struct ImportRun {
+pub struct ImportRun {
     client: Arc<Client>,
     started: bool,
+}
+
+/// Live import progress, shared between the import worker and the dialog: the file downloading
+/// now — its name, bytes done, and total (0 when the server did not say). The bar moves inside a
+/// single photo, not only between photos.
+#[derive(Default)]
+pub struct ImportProgress {
+    name: Mutex<String>,
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+impl ImportProgress {
+    /// The line under the bar: the current file, and how much of it arrived.
+    fn line(&self) -> Option<String> {
+        let name = self.name.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if name.is_empty() {
+            return None;
+        }
+        let (done, total) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        Some(if total > 0 {
+            format!("{name} — {:.1} of {:.1} MB", done as f64 / 1e6, total as f64 / 1e6)
+        } else {
+            format!("{name} — {:.1} MB", done as f64 / 1e6)
+        })
+    }
+
+    /// How much of the current file has arrived (0 when nothing is downloading).
+    fn file_fraction(&self) -> f32 {
+        let total = self.total.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        (self.done.load(Ordering::Relaxed) as f32 / total as f32).min(1.0)
+    }
 }
 
 impl Drop for ImportRun {
@@ -221,10 +256,13 @@ pub struct ImmichTask {
     pub thumbs: HashMap<String, egui::TextureHandle>,
     thumb_failed: HashSet<String>,
     thumb_busy: Arc<AtomicUsize>,
-    import: Option<ImportRun>,
+    /// The import running now (its worker and cancel flag); `None` between imports.
+    pub import: Option<ImportRun>,
     pub(crate) import_done: bool,
     /// `(asset id, file name)` for the running import.
     import_ids: Vec<(String, String)>,
+    /// Live download progress for the import worker (name, bytes, total).
+    pub import_progress: Arc<ImportProgress>,
     /// Downloads that wait for the next `library.import` commit.
     staged: Vec<(String, String)>,
     staging: PathBuf,
@@ -428,32 +466,54 @@ fn staged_path(staging: &std::path::Path, name: &str, id: &str) -> PathBuf {
 /// [`Event::ImportFinished`]). Runs on the worker; the client's cancel flag stops it between
 /// files and mid-transfer. Whatever is still in the folder when this thread exits never joined
 /// the catalog, and is removed best-effort.
-fn spawn_import(tx: Sender<Event>, client: Arc<Client>, staging: PathBuf, jobs: Vec<(String, String)>, ctx: &egui::Context) -> Result<(), String> {
+fn spawn_import(
+    tx: Sender<Event>,
+    client: Arc<Client>,
+    staging: PathBuf,
+    jobs: Vec<(String, String)>,
+    progress: Arc<ImportProgress>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
     spawn("lc-immich-import", ctx, move || {
         for (id, given) in &jobs {
             if client.cancelled() {
                 break;
             }
-            let dest = staged_path(&staging, &safe_file_name(given, id), id);
+            let name = safe_file_name(given, id);
+            *progress.name.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
+            progress.done.store(0, Ordering::Relaxed);
+            progress.total.store(0, Ordering::Relaxed);
+            let dest = staged_path(&staging, &name, id);
             match std::fs::File::create(&dest) {
-                Ok(mut file) => match client.download_original(id, &mut file, |_| {}) {
-                    Ok(n) if n > 0 => {
-                        let _ = tx.send(Event::Downloaded { id: id.clone(), path: Some(dest.to_string_lossy().into_owned()), error: None });
+                Ok(mut file) => {
+                    let p = progress.clone();
+                    match client.download_original(id, &mut file, move |done, total| {
+                        p.done.store(done, Ordering::Relaxed);
+                        if total > 0 {
+                            p.total.store(total, Ordering::Relaxed);
+                        }
+                    }) {
+                        Ok(n) if n > 0 => {
+                            let _ = tx.send(Event::Downloaded { id: id.clone(), path: Some(dest.to_string_lossy().into_owned()), error: None });
+                        }
+                        Ok(_) => {
+                            let _ = std::fs::remove_file(&dest);
+                            let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some("the server sent an empty file".into()) });
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&dest);
+                            let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some(e.to_string()) });
+                        }
                     }
-                    Ok(_) => {
-                        let _ = std::fs::remove_file(&dest);
-                        let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some("the server sent an empty file".into()) });
-                    }
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&dest);
-                        let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some(e.to_string()) });
-                    }
-                },
+                }
                 Err(e) => {
                     let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some(format!("could not write the download: {e}")) });
                 }
             }
         }
+        progress.name.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        progress.done.store(0, Ordering::Relaxed);
+        progress.total.store(0, Ordering::Relaxed);
         // ImportFinished is handled (and the folder cleaned) on the UI side: files a cancelled
         // run left behind must stay until tick has offered them to the library.
         let _ = tx.send(Event::ImportFinished);
@@ -548,6 +608,7 @@ pub fn open(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
         import: None,
         import_done: false,
         import_ids: Vec::new(),
+        import_progress: Arc::new(ImportProgress::default()),
         staged: Vec::new(),
         staging,
         total: 0,
@@ -657,8 +718,8 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
         to_spawn = Some((run.client.clone(), std::mem::take(&mut task.import_ids)));
     }
     if let Some((client, jobs)) = to_spawn {
-        let (tx, staging) = (task.tx.clone(), task.staging.clone());
-        if let Err(e) = spawn_import(tx, client, staging, jobs, ctx) {
+        let (tx, staging, progress) = (task.tx.clone(), task.staging.clone(), task.import_progress.clone());
+        if let Err(e) = spawn_import(tx, client, staging, jobs, progress, ctx) {
             task.import = None;
             set_dialog_lines(app, Some(e), None);
         }
@@ -727,9 +788,14 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                 while !task.staged.is_empty() {
                     commit_batch(app, &mut task);
                 }
+                let imported = task.imported;
                 finish_import(app, &mut task);
                 // whatever is left never made it into the library: drop it with the run
                 purge_staging(&task.staging);
+                if imported > 0 {
+                    let plural = if imported == 1 { "" } else { "s" };
+                    app.toast(ctx, crate::i18n::tr_format!("Added {} photo{} from Immich.", imported, plural));
+                }
             }
         }
         while task.staged.len() >= COMMIT_BATCH {
@@ -962,7 +1028,9 @@ const CANCEL_FLAG: &str = "immich-cancel-requested";
 fn import_progress(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(task) = &app.immich_task else { return };
-    let frac = task.done as f32 / task.total.max(1) as f32;
+    // photos finished, plus the fraction of the one downloading now — the bar moves inside a
+    // single photo, which is the whole point when there is only one
+    let frac = ((task.done as f32) + if task.import_done { 0.0 } else { task.import_progress.file_fraction() }) / task.total.max(1) as f32;
     let head: String = if task.import_done {
         crate::i18n::tr("Done.").to_string()
     } else if task.cancelled {
@@ -970,9 +1038,15 @@ fn import_progress(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     } else {
         crate::i18n::tr_format!("Adding photos… {} of {}", task.done, task.total)
     };
-    ui.label(egui::RichText::new(head).color(t.text));
+    let r = ui.label(egui::RichText::new(head).color(t.text));
+    register(ui.ctx(), "label:immichProgressHead", r.rect);
     if !task.import_done {
-        ui.add(egui::ProgressBar::new(frac).desired_width(420.0));
+        let r = ui.add(egui::ProgressBar::new(frac).desired_width(420.0));
+        register(ui.ctx(), "bar:immichProgress", r.rect);
+        if let Some(line) = task.import_progress.line() {
+            let r = ui.label(egui::RichText::new(line).color(t.text_dim).small());
+            register(ui.ctx(), "label:immichProgressFile", r.rect);
+        }
     }
     let summary = crate::i18n::tr_format!("Imported {} · {} already in the library · {} failed", task.imported, task.skipped, task.failed.len());
     let r = ui.label(egui::RichText::new(summary).color(t.text_dim));

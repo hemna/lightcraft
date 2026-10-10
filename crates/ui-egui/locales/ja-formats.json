@@ -109,6 +109,7 @@
   "Import cancelled · {} photo{} added": "読み込みを中止しました・{}枚を追加{:.0}",
   "Reading photos… {} of {}": "写真を確認中：{1}枚中{0}枚",
   "Adding photos… {} of {}": "写真を追加中：{1}枚中{0}枚",
+  "Added {} photo{} from Immich.": "Immichから写真を{}枚追加しました。{:.0}",
   " ({} in Recently Deleted)": "（うち{}枚は最近削除した写真）",
   "Already in the library: {} photo{} selected in All Photos": "ライブラリに登録済み：すべての写真で{}枚を選択しました{:.0}",
   "Already in the library, in Recently Deleted: {} photo{} selected · right-click ▸ Restore, or Delete Permanently to import afresh": "ライブラリの「最近削除した写真」にあります：{}枚を選択しました{:.0}・右クリック → 復元、または完全に削除してから読み込み直し",

@@ -13,6 +13,7 @@
   "Added {n} photo{} to My Photos": "已將 {n} 張照片加入我的照片{:.0}",
   "Added {n} photo{} to “{}”": "已將 {n} 張照片加入「{1}」{0:.0}",
   "Adding photos… {} of {}": "正在新增照片… {}／{}",
+  "Added {} photo{} from Immich.": "已從 Immich 新增 {} 張照片。{:.0}",
   "All {n} selected photos move by the same amount.": "所有 {n} 張選取的照片會調整相同的時間。",
   "Auto ({})": "自動（{}）",
   "Auto Sync: edits apply to {n} photos": "自動同步：編輯會套用至 {n} 張照片",

@@ -109,6 +109,7 @@
   "Import cancelled · {} photo{} added": "导入已取消 · 已添加 {0} 张照片{1:.0}",
   "Reading photos… {} of {}": "正在读取照片… 第 {0} 张，共 {1} 张",
   "Adding photos… {} of {}": "正在添加照片… 第 {0} 张，共 {1} 张",
+  "Added {} photo{} from Immich.": "已从 Immich 添加 {} 张照片。{:.0}",
   " ({} in Recently Deleted)": "（其中 {0} 张在“最近删除”中）",
   "Already in the library: {} photo{} selected in All Photos": "已在图库中：已在“所有照片”中选择 {0} 张照片{1:.0}",
   "Already in the library, in Recently Deleted: {} photo{} selected · right-click ▸ Restore, or Delete Permanently to import afresh": "已在图库的“最近删除”中：已选择 {0} 张照片{1:.0} · 右键单击 → 恢复，或永久删除后重新导入",

@@ -345,7 +345,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
         let given = c.asset(id).map(|a| a.original_file_name).unwrap_or_default();
         let dest = staged_path(&staging, &safe_file_name(&given, id));
         match std::fs::File::create(&dest) {
-            Ok(mut f) => match c.download_original(id, &mut f, |_| {}) {
+            Ok(mut f) => match c.download_original(id, &mut f, |_, _| {}) {
                 Ok(n) if n > 0 => paths.push(dest.to_string_lossy().into_owned()),
                 Ok(_) => {
                     let _ = std::fs::remove_file(&dest);
