@@ -159,8 +159,10 @@ fn browse_select_and_import_round_trip_through_the_dialog() {
     assert!(settled, "the thumbnail loaded and the in-flight count returned to zero");
     let r = h.request("ui.clickWidget", json!({"id": "button:immichImport"}), T);
     assert_eq!(r["ok"], true, "Import is enabled with a selection: {r}");
-    // the dialog became a progress window the moment the button went down
-    let progressed = h.step_until(SETTLE, |h| h.app.immich_task.as_ref().is_some_and(|t| t.import.is_some() || t.import_done));
+    // the dialog became a progress window the moment the button went down (the job is the
+    // engine's: the dialog only shows it)
+    let progressed =
+        h.step_until(SETTLE, |h| h.app.session.immich_import.as_ref().is_some() || h.app.immich_task.as_ref().is_some_and(|t| t.import_done));
     assert!(progressed, "the import started");
     let done = h.step_until(SETTLE, |h| h.app.session.catalog.len() == 1);
     assert!(done, "the download and library.import completed");

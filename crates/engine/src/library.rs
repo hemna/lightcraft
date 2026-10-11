@@ -597,6 +597,54 @@ impl Session {
         crate::cmd::immich::save(self)
     }
 
+    /// Take in what the background Immich import's worker brought back, and — when it is done —
+    /// join the staged files through the same `library.import` the synchronous path uses (one
+    /// undo step). Cheap when nothing has moved; call it every frame while the dialog is open.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn poll_immich_import(&mut self) {
+        let done = self.immich_import.as_mut().and_then(crate::cmd::immich::ImmichImportJob::poll);
+        let Some((paths, failed)) = done else {
+            return;
+        };
+        let Some(job) = self.immich_import.as_ref() else {
+            return;
+        };
+        let (mode, staging) = (job.mode().to_string(), job.staging().to_path_buf());
+        let finished = if paths.is_empty() {
+            let _ = std::fs::remove_dir(&staging);
+            serde_json::json!({ "failed": failed, "error": "nothing could be downloaded" })
+        } else {
+            let params = serde_json::json!({ "paths": paths, "mode": mode });
+            match self.execute("library.import", &params) {
+                Ok(report) => {
+                    if mode == "copy" {
+                        // the bytes are in the library now; the staged copies have no further use
+                        for path in &paths {
+                            if let Err(e) = std::fs::remove_file(path) {
+                                log::warn!("immich: staging cleanup: {path}: {e}");
+                            }
+                        }
+                        let _ = std::fs::remove_dir(&staging);
+                    }
+                    serde_json::json!({ "report": report, "failed": failed })
+                }
+                Err(e) => serde_json::json!({ "failed": failed, "error": e.to_string() }),
+            }
+        };
+        if let Some(job) = self.immich_import.as_mut() {
+            job.finished = Some(finished);
+        }
+    }
+
+    /// Stop a running background Immich import (the dialog's Cancel): in-flight transfers stop at
+    /// the next chunk, no new file is started, and the finished downloads still join the library.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn cancel_immich_import(&mut self) {
+        if let Some(job) = self.immich_import.as_mut() {
+            job.cancel();
+        }
+    }
+
     /// Warnings about the open library not handed out yet: its settings files, and a lock that
     /// couldn't be taken (the UI shows each once; the CLI and MCP print them on stderr).
     pub fn take_library_warnings(&mut self) -> Vec<String> {

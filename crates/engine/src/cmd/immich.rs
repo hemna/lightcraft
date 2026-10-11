@@ -8,10 +8,12 @@
 //! folder is what people back up and sync, and a key must not travel with it. The file holds the
 //! keys unencrypted in v1; the OS-keychain follow-up is tracked with the design spec.
 //!
-//! Network calls happen on whatever thread runs the command — native only, like
-//! `lightcraft-fetch`. On wasm this module ships the settings commands only; the UI's Immich
-//! dialog runs its searches and downloads on its own worker, so these commands are for the CLI
-//! and MCP, where waiting for the answer is the point.
+//! Network calls are native only, like `lightcraft-fetch`. On wasm this module ships the
+//! settings commands only. The CLI and MCP run `immich.import` synchronously (waiting for the
+//! answer is the point); the UI's dialog runs the same command in `background` mode, where the
+//! engine's own worker downloads and the session commits, so all three share one import path.
+//! The dialog's searches and thumbnails still go over its own worker — they are browsing, not
+//! import.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,6 +115,141 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
         return Err(EngineError::Other(format!("immich: could not save the settings file: {e}")));
     }
     Ok(())
+}
+
+/// One background `immich.import` run (the dialog's path). The engine's own worker thread does
+/// the lookups and the downloads; the session thread takes the progress in and commits the
+/// catalog through the same `library.import` the synchronous path uses — one undo step for the
+/// whole import. The UI reads the public fields every frame; the CLI and MCP never see this,
+/// they wait on the command.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ImmichImportJob {
+    /// The ids being imported.
+    pub total: usize,
+    /// Files whose download ended (successfully or not).
+    pub done: usize,
+    /// The file downloading now ("" between files).
+    pub current_file: String,
+    /// How much of the current file has arrived, and the announced total (0 when the server did not say).
+    pub file_done: u64,
+    pub file_total: u64,
+    /// One `{id, error}` per asset the server would not give (read while running and at the end).
+    pub failed: Vec<Value>,
+    /// `None` while it runs; at the end, `{report, failed}` (or `{failed, error}`).
+    pub finished: Option<Value>,
+    /// True once the user asked to stop it (the finished downloads still join).
+    pub cancelled: bool,
+    rx: Option<std::sync::mpsc::Receiver<ImportMsg>>,
+    client: std::sync::Arc<lightcraft_immich::Client>,
+    staging: std::path::PathBuf,
+    mode: String,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum ImportMsg {
+    /// A new file starts downloading: its staged name.
+    Start { name: String },
+    /// Progress of the current file (bytes arrived, announced total).
+    Progress { done: u64, total: u64 },
+    /// The run is over: the staged files that should join the library, and the fetch failures.
+    Done { paths: Vec<String>, failed: Vec<Value> },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ImmichImportJob {
+    /// The Cancel button: in-flight transfers stop at the next chunk, no new file is started,
+    /// and the finished downloads still join the library.
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+        self.client.set_cancelled(true);
+    }
+
+    /// Drop the job because its owner went away (the dialog closed mid-import): stop the worker
+    /// and drop what never joined the library. Best effort — the worker may be mid-write.
+    pub fn abandon(&mut self) {
+        self.cancelled = true;
+        self.client.set_cancelled(true);
+        let _ = std::fs::remove_dir_all(&self.staging);
+    }
+
+    /// How much of the current file has arrived (1.0 when nothing is downloading).
+    pub fn file_fraction(&self) -> f32 {
+        if self.file_total == 0 {
+            return 0.0;
+        }
+        (self.file_done as f32 / self.file_total as f32).min(1.0)
+    }
+
+    /// The `library.import` mode the run commits in.
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    /// Where the run's files are staged (cleaned up by the session once they join).
+    pub fn staging(&self) -> &std::path::Path {
+        &self.staging
+    }
+
+    /// Take in what the worker brought back. Returns the run's result exactly once (when the
+    /// worker is done); the session then commits the files and stores it in `finished`.
+    pub fn poll(&mut self) -> Option<(Vec<String>, Vec<Value>)> {
+        let rx = self.rx.as_ref()?;
+        let mut done = None;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ImportMsg::Start { name } => {
+                    self.current_file = name;
+                    self.file_done = 0;
+                    self.file_total = 0;
+                }
+                ImportMsg::Progress { done, total } => {
+                    self.file_done = done;
+                    if total > 0 {
+                        self.file_total = total;
+                    }
+                }
+                ImportMsg::Done { paths, failed } => done = Some((paths, failed)),
+            }
+        }
+        if done.is_some() {
+            self.rx = None;
+            self.current_file.clear();
+            self.done = self.total;
+        }
+        done
+    }
+}
+
+/// Download `id`'s original into `staging` under the given name, reporting progress. Returns the
+/// staged file, or the failure (as `immich.import` reports it).
+#[cfg(not(target_arch = "wasm32"))]
+fn download_one(
+    c: &lightcraft_immich::Client,
+    staging: &std::path::Path,
+    id: &str,
+    name: &str,
+    progress: impl FnMut(u64, u64),
+) -> std::result::Result<std::path::PathBuf, Value> {
+    let dest = staged_path(staging, name);
+    match std::fs::File::create(&dest) {
+        Ok(mut f) => c.download_original(id, &mut f, progress).map_err(|e| json!({ "id": id, "error": e.to_string() })).and_then(|n| {
+            if n == 0 {
+                let _ = std::fs::remove_file(&dest);
+                Err(json!({ "id": id, "error": "the server sent an empty file" }))
+            } else {
+                Ok(dest)
+            }
+        }),
+        Err(e) => Err(json!({ "id": id, "error": format!("could not write the download: {e}") })),
+    }
+}
+
+/// The name a download lands under: the server's file name when it is usable, else the id — cut
+/// at a char boundary (agent-supplied text is not).
+#[cfg(not(target_arch = "wasm32"))]
+fn name_of(c: &lightcraft_immich::Client, id: &str) -> String {
+    let given = c.asset(id).map(|a| a.original_file_name).unwrap_or_default();
+    safe_file_name(&given, id)
 }
 
 fn valid_url(url: &str) -> bool {
@@ -408,6 +545,10 @@ fn staged_path(staging: &std::path::Path, name: &str) -> std::path::PathBuf {
 /// Download the named assets, then run them through the untouched import pipeline (probe,
 /// content-hash dedupe, undoable add/copy). `copy` (the default) places the originals in the
 /// library like any other import; `add` keeps the staged files in place.
+///
+/// `background: true` (the dialog's path) starts the engine's own worker and returns at once;
+/// the run then lives in `Session::immich_import`, polled with `poll_immich_import`. Without it
+/// (CLI, MCP) the command does the work and waits, like before.
 #[cfg(not(target_arch = "wasm32"))]
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     const CID: &str = "immich.import";
@@ -432,26 +573,48 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(CID, "`mode` is \"copy\" (default — into the library) or \"add\" (keep the downloaded files where they are)"));
     }
     let srv = server_of(s, p, CID)?;
-    let c = lightcraft_immich::Client::new(&srv.url, &srv.api_key, Default::default()).map_err(net(CID))?;
+    let client = std::sync::Arc::new(lightcraft_immich::Client::new(&srv.url, &srv.api_key, Default::default()).map_err(net(CID))?);
+    let background = p.get("background").and_then(Value::as_bool).unwrap_or(false);
+    if background {
+        if s.immich_import.as_ref().is_some_and(|job| job.finished.is_none()) {
+            return Err(EngineError::Other("immich.import: an import is already running".to_string()));
+        }
+        let staging = staging_dir()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("lc-immich-import".into())
+            .spawn({
+                let client = client.clone();
+                let staging = staging.clone();
+                let ids = ids.clone();
+                move || run_download_worker(tx, client, staging, ids)
+            })
+            .map_err(|e| EngineError::Other(format!("{CID}: could not start the import worker: {e}")))?;
+        s.immich_import = Some(ImmichImportJob {
+            total: ids.len(),
+            done: 0,
+            current_file: String::new(),
+            file_done: 0,
+            file_total: 0,
+            failed: Vec::new(),
+            finished: None,
+            cancelled: false,
+            rx: Some(rx),
+            client,
+            staging,
+            mode: mode.to_string(),
+        });
+        let _ = worker; // a dead worker simply never answers; its sends fail and the job ends empty
+        return Ok(json!({ "importing": ids.len() }));
+    }
     let staging = staging_dir()?;
     let mut paths: Vec<String> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
     for id in &ids {
-        let given = c.asset(id).map(|a| a.original_file_name).unwrap_or_default();
-        let dest = staged_path(&staging, &safe_file_name(&given, id));
-        match std::fs::File::create(&dest) {
-            Ok(mut f) => match c.download_original(id, &mut f, |_, _| {}) {
-                Ok(n) if n > 0 => paths.push(dest.to_string_lossy().into_owned()),
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&dest);
-                    failed.push(json!({ "id": id, "error": "the server sent an empty file" }));
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&dest);
-                    failed.push(json!({ "id": id, "error": e.to_string() }));
-                }
-            },
-            Err(e) => failed.push(json!({ "id": id, "error": format!("could not write the download: {e}") })),
+        let name = name_of(client.as_ref(), id);
+        match download_one(client.as_ref(), &staging, id, &name, |_, _| {}) {
+            Ok(dest) => paths.push(dest.to_string_lossy().into_owned()),
+            Err(f) => failed.push(f),
         }
     }
     if paths.is_empty() {
@@ -475,6 +638,40 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
         let _ = std::fs::remove_dir(&staging);
     }
     Ok(json!({ "report": report, "failed": failed }))
+}
+
+/// The background worker: look up each id, download its original into `staging`, and report.
+/// The client's cancel flag stops it between files and mid-transfer; whatever is staged when it
+/// exits still joins the library.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_download_worker(
+    tx: std::sync::mpsc::Sender<ImportMsg>,
+    client: std::sync::Arc<lightcraft_immich::Client>,
+    staging: std::path::PathBuf,
+    ids: Vec<String>,
+) {
+    let mut paths: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for id in &ids {
+        if client.cancelled() {
+            break;
+        }
+        let name = name_of(client.as_ref(), id);
+        let _ = tx.send(ImportMsg::Start { name: name.clone() });
+        // one channel message per megabyte is plenty for a progress bar
+        let mut last_mb: u64 = u64::MAX;
+        match download_one(client.as_ref(), &staging, id, &name, |done, total| {
+            let mb = done / (1024 * 1024);
+            if mb != last_mb {
+                last_mb = mb;
+                let _ = tx.send(ImportMsg::Progress { done, total });
+            }
+        }) {
+            Ok(dest) => paths.push(dest.to_string_lossy().into_owned()),
+            Err(f) => failed.push(f),
+        }
+    }
+    let _ = tx.send(ImportMsg::Done { paths, failed });
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -532,10 +729,32 @@ pub fn specs() -> Vec<CommandSpec> {
             "Import from Immich",
             [],
             None,
-            "{server?, ids: [assetId...], mode? (\"copy\" default, into the library; \"add\" keeps the files in the staging folder), album?|albumName?} — download the assets and run the ordinary import over them (dedupe, undo) → {report, failed: [{id, error}]}",
+            "{server?, ids: [assetId...], mode? (\"copy\" default, into the library; \"add\" keeps the files in the staging folder), album?|albumName?, background? (true = run on the engine's worker and return at once, for the UI; poll Session::immich_import, then it is {report, failed})} — download the assets and run the ordinary import over them (dedupe, undo) → {report, failed: [{id, error}]} (synchronous: {importing} once started in background mode)",
             always,
             import
         ));
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_names_stay_safe_and_unique() {
+        let dir = std::env::temp_dir().join(format!("lc-immich-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(safe_file_name("../../etc/pa:sswd.jpg", "id1"), "pa_sswd.jpg", "the directory is dropped, not flattened");
+        assert_eq!(safe_file_name("", "id123456"), "immich-id123456");
+        let a = staged_path(&dir, "x.jpg");
+        std::fs::File::create(&a).unwrap(); // the worker reserves the name before the next lookup
+        let b = staged_path(&dir, "x.jpg");
+        assert_eq!(a.file_name().unwrap().to_string_lossy(), "x.jpg");
+        assert_eq!(b.file_name().unwrap().to_string_lossy(), "x-1.jpg");
+        // an extension that is not one stays in the stem
+        assert_eq!(staged_path(&dir, "weird.nope.nope").file_name().unwrap().to_string_lossy(), "weird.nope.nope");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

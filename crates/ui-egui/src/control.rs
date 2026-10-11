@@ -135,7 +135,8 @@ pub fn memory(app: &LightcraftApp) -> Value {
 /// The Immich dialog's workers (`ui.inspect` → `immich`); the browser build talks to no server.
 #[cfg(not(target_arch = "wasm32"))]
 fn immich_status(app: &LightcraftApp) -> Option<Value> {
-    app.immich_task.as_ref().map(crate::immich::ImmichTask::status)
+    let importing = app.session.immich_import.as_ref().is_some_and(|j| j.finished.is_none());
+    app.immich_task.as_ref().map(|t| t.status(importing))
 }
 
 #[cfg(target_arch = "wasm32")]

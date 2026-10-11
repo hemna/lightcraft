@@ -307,8 +307,6 @@ fn a_download_reports_progress_and_returns_its_bytes() {
     h.join().unwrap();
 }
 
-
-
 #[test]
 fn an_unusable_configuration_is_an_error_not_a_panic() {
     assert!(Client::new("ftp://example.com", "k", Limits::default()).is_err());

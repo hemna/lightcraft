@@ -3,15 +3,17 @@
 //!
 //! The dialog is the state (filters, the browsed page, the selection — it travels with
 //! [`crate::state::Dialog`] so it serializes with the UI state); its workers are the app-level
-//! [`ImmichTask`], like the import review's [`crate::import::ImportTask`]: every network call runs
-//! on a worker thread ([`lightcraft_immich`], native only) and its results arrive over a channel
-//! that [`tick`] drains between frames — the UI thread never waits for the network. Downloads
-//! (originals) land in a staging folder under the system temp dir; batches of a few finished
-//! downloads join the catalog through the untouched `library.import` command, so de-duplication,
-//! the undo step and the durable save behave exactly like any other import.
+//! [`ImmichTask`], like the import review's [`crate::import::ImportTask`]: every network call
+//! runs on a worker thread ([`lightcraft_immich`], native only) and its results arrive over a
+//! channel that [`tick`] drains between frames — the UI thread never waits for the network.
 //!
-//! Cancel is a flag: an in-flight transfer stops at its next chunk, started batches stay
-//! imported, and nothing new is started.
+//! The import itself goes through the engine's `immich.import` command in background mode — the
+//! same command the CLI and MCP run — where the engine's worker downloads and the session joins
+//! the files through `library.import`, so de-duplication, the undo step and the durable save
+//! behave exactly like any other import. This module only shows that run's progress and Cancel.
+//!
+//! Cancel is a flag: an in-flight transfer stops at its next chunk, the finished downloads still
+//! join, and nothing new is started.
 //!
 //! Server entries (URL + API key) are the engine's `immich.servers` command's business; this
 //! module only reads [`lightcraft_engine::Session::immich_servers`]. Keys never enter a log line,
@@ -19,7 +21,6 @@
 //! them out.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -36,8 +37,6 @@ use crate::state::Dialog;
 use crate::theme::Tokens;
 use crate::widgets::register;
 
-/// Assets per `library.import` commit while importing.
-const COMMIT_BATCH: usize = 8;
 /// Assets browsed per page (the engine's own default for `immich.browse`).
 const PAGE_SIZE: u32 = 60;
 /// Thumbnails fetched at once; the rest wait for the next frame.
@@ -178,63 +177,6 @@ enum Event {
         id: String,
         image: Option<lightcraft_raster::Rgba8>,
     },
-    /// One download ended: its staging path, or the reason it failed.
-    Downloaded {
-        id: String,
-        path: Option<String>,
-        error: Option<String>,
-    },
-    /// The import worker is done (finished, cancelled or dead); commit what is left and close out.
-    ImportFinished,
-}
-
-/// An import run: its client (whose cancel flag the Cancel button raises) and whether its worker
-/// has been spawned yet (the first [`tick`] after the button does that, with a real context).
-pub struct ImportRun {
-    client: Arc<Client>,
-    started: bool,
-}
-
-/// Live import progress, shared between the import worker and the dialog: the file downloading
-/// now — its name, bytes done, and total (0 when the server did not say). The bar moves inside a
-/// single photo, not only between photos.
-#[derive(Default)]
-pub struct ImportProgress {
-    name: Mutex<String>,
-    done: AtomicU64,
-    total: AtomicU64,
-}
-
-impl ImportProgress {
-    /// The line under the bar: the current file, and how much of it arrived.
-    fn line(&self) -> Option<String> {
-        let name = self.name.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if name.is_empty() {
-            return None;
-        }
-        let (done, total) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
-        Some(if total > 0 {
-            format!("{name} — {:.1} of {:.1} MB", done as f64 / 1e6, total as f64 / 1e6)
-        } else {
-            format!("{name} — {:.1} MB", done as f64 / 1e6)
-        })
-    }
-
-    /// How much of the current file has arrived (0 when nothing is downloading).
-    fn file_fraction(&self) -> f32 {
-        let total = self.total.load(Ordering::Relaxed);
-        if total == 0 {
-            return 0.0;
-        }
-        (self.done.load(Ordering::Relaxed) as f32 / total as f32).min(1.0)
-    }
-}
-
-impl Drop for ImportRun {
-    /// A dropped import (dialog closed, or the task replaced) stops its worker at the next chunk.
-    fn drop(&mut self) {
-        self.client.set_cancelled(true);
-    }
 }
 
 /// The Immich dialog's workers and their state (native only — `lightcraft-immich` does not exist
@@ -256,16 +198,8 @@ pub struct ImmichTask {
     pub thumbs: HashMap<String, egui::TextureHandle>,
     thumb_failed: HashSet<String>,
     thumb_busy: Arc<AtomicUsize>,
-    /// The import running now (its worker and cancel flag); `None` between imports.
-    pub import: Option<ImportRun>,
+    /// The last import joined the library (the dialog shows its summary until closed).
     pub(crate) import_done: bool,
-    /// `(asset id, file name)` for the running import.
-    import_ids: Vec<(String, String)>,
-    /// Live download progress for the import worker (name, bytes, total).
-    pub import_progress: Arc<ImportProgress>,
-    /// Downloads that wait for the next `library.import` commit.
-    staged: Vec<(String, String)>,
-    staging: PathBuf,
     pub total: usize,
     pub done: usize,
     pub imported: usize,
@@ -282,7 +216,7 @@ pub struct ImmichTask {
 
 impl std::fmt::Debug for ImmichTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ImmichTask").field("searching", &self.searching).field("importing", &self.import.is_some()).finish()
+        f.debug_struct("ImmichTask").field("searching", &self.searching).finish()
     }
 }
 
@@ -302,8 +236,8 @@ impl Drop for ThumbSlot {
 
 impl ImmichTask {
     /// `{phase, total, done, failed}` for `ui.inspect`.
-    pub fn status(&self) -> Value {
-        let phase = if self.import.is_some() {
+    pub fn status(&self, importing: bool) -> Value {
+        let phase = if importing {
             "importing"
         } else if self.import_done {
             "finished"
@@ -315,7 +249,7 @@ impl ImmichTask {
 
     /// A worker is still expected to answer (keep asking for frames).
     fn busy(&self) -> bool {
-        self.searching || self.albums_busy || self.import.is_some() || self.thumb_busy.load(Ordering::Relaxed) > 0
+        self.searching || self.albums_busy || self.thumb_busy.load(Ordering::Relaxed) > 0
     }
 
     /// Ask for one cell's thumbnail, bounded to [`THUMB_IN_FLIGHT`] at once; the grid asks every
@@ -444,157 +378,6 @@ fn start_search(task: &mut ImmichTask, query: SearchQuery, ctx: &egui::Context) 
     }
 }
 
-/// Strip a server-supplied name down to one safe file name (the engine's `immich.import` does the
-/// same for its staging folder).
-fn safe_file_name(given: &str, id: &str) -> String {
-    let base = given.rsplit(['/', '\\']).next().unwrap_or(given);
-    let mut out: String =
-        base.chars().map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c }).collect();
-    let trimmed = out.trim_matches(|c| c == ' ' || c == '.');
-    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        let short: String = id.chars().take(64).collect();
-        return format!("immich-{short}");
-    }
-    if out.chars().count() > 200 {
-        out = out.chars().take(200).collect();
-    }
-    out
-}
-
-/// A unique path in the staging folder for `name` (`-1`, `-2`, … when taken; the asset id last).
-fn staged_path(staging: &std::path::Path, name: &str, id: &str) -> PathBuf {
-    let stem = name
-        .rsplit_once('.')
-        .filter(|(s, e)| !s.is_empty() && !e.is_empty() && e.len() <= 8)
-        .map_or_else(|| (name.to_string(), String::new()), |(s, e)| (s.to_string(), format!(".{e}")));
-    for n in 0..1000u32 {
-        let candidate = if n == 0 { staging.join(name) } else { staging.join(format!("{}-{n}{}", stem.0, stem.1)) };
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    let short: String = id.chars().take(64).collect();
-    staging.join(format!("immich-{short}.bin"))
-}
-
-/// Download the chosen originals to `staging` (one [`Event::Downloaded`] per asset, then
-/// [`Event::ImportFinished`]). Runs on the worker; the client's cancel flag stops it between
-/// files and mid-transfer. Whatever is still in the folder when this thread exits never joined
-/// the catalog, and is removed best-effort.
-fn spawn_import(
-    tx: Sender<Event>,
-    client: Arc<Client>,
-    staging: PathBuf,
-    jobs: Vec<(String, String)>,
-    progress: Arc<ImportProgress>,
-    ctx: &egui::Context,
-) -> Result<(), String> {
-    spawn("lc-immich-import", ctx, move || {
-        for (id, given) in &jobs {
-            if client.cancelled() {
-                break;
-            }
-            let name = safe_file_name(given, id);
-            *progress.name.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
-            progress.done.store(0, Ordering::Relaxed);
-            progress.total.store(0, Ordering::Relaxed);
-            let dest = staged_path(&staging, &name, id);
-            match std::fs::File::create(&dest) {
-                Ok(mut file) => {
-                    let p = progress.clone();
-                    match client.download_original(id, &mut file, move |done, total| {
-                        p.done.store(done, Ordering::Relaxed);
-                        if total > 0 {
-                            p.total.store(total, Ordering::Relaxed);
-                        }
-                    }) {
-                        Ok(n) if n > 0 => {
-                            let _ = tx.send(Event::Downloaded { id: id.clone(), path: Some(dest.to_string_lossy().into_owned()), error: None });
-                        }
-                        Ok(_) => {
-                            let _ = std::fs::remove_file(&dest);
-                            let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some("the server sent an empty file".into()) });
-                        }
-                        Err(e) => {
-                            let _ = std::fs::remove_file(&dest);
-                            let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some(e.to_string()) });
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Event::Downloaded { id: id.clone(), path: None, error: Some(format!("could not write the download: {e}")) });
-                }
-            }
-        }
-        progress.name.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        progress.done.store(0, Ordering::Relaxed);
-        progress.total.store(0, Ordering::Relaxed);
-        // ImportFinished is handled (and the folder cleaned) on the UI side: files a cancelled
-        // run left behind must stay until tick has offered them to the library.
-        let _ = tx.send(Event::ImportFinished);
-    })
-}
-
-/// Add one batch of downloaded originals to the catalog (the same `library.import` a disk import
-/// runs; one undo step per batch, merged into one when the import ends).
-fn commit_batch(app: &mut LightcraftApp, task: &mut ImmichTask) {
-    let n = task.staged.len().min(COMMIT_BATCH);
-    if n == 0 {
-        return;
-    }
-    let batch: Vec<(String, String)> = task.staged.drain(..n).collect();
-    let paths: Vec<&str> = batch.iter().map(|(_, p)| p.as_str()).collect();
-    match app.session.execute_fn("library.import", |s| s.execute("library.import", &json!({"paths": paths, "mode": "copy"}))) {
-        Ok(v) => {
-            let len = |k: &str| v[k].as_array().map_or(0, Vec::len);
-            task.imported += len("imported");
-            task.skipped += len("duplicates");
-            for entry in v["failed"].as_array().into_iter().flatten() {
-                // the report's `failed` is (path, reason) pairs: the file name and the library's
-                // own reason ("Heif files are not supported yet"), never a generic stand-in
-                let (path, reason) = entry
-                    .as_array()
-                    .map(|a| (a.first().and_then(Value::as_str).unwrap_or(""), a.get(1).and_then(Value::as_str).unwrap_or("import failed")))
-                    .unwrap_or(("", "import failed"));
-                let name = path.rsplit('/').next().unwrap_or(path);
-                task.failed.push(format!("{name}: {reason}"));
-            }
-            task.done += n;
-            // the bytes are in the library now; the staged copies have no further use
-            for (_, path) in &batch {
-                if let Err(e) = std::fs::remove_file(path) {
-                    log::warn!("immich: staging cleanup: {path}: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("immich import: {e}");
-            task.done += n;
-            for (_, path) in &batch {
-                let name = std::path::Path::new(path).file_name().map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned());
-                task.failed.push(format!("{name}: {e}"));
-            }
-        }
-    }
-}
-
-/// The import ended (finished or cancelled): merge its batches into one undo step.
-fn finish_import(app: &mut LightcraftApp, task: &mut ImmichTask) {
-    if let Some(run) = task.import.take() {
-        drop(run);
-    }
-    task.import_done = true;
-    let steps = app.session.undo.len().saturating_sub(task.undo0);
-    if task.imported > 0 {
-        let plural = if task.imported == 1 { "" } else { "s" };
-        app.session.merge_undo(steps, &crate::i18n::tr_format!("Add {} Photo{}", task.imported, plural));
-    }
-}
-
-/// Distinguishes staging folders inside one process (parallel tests, a reopen): one dialog's
-/// close must not purge another's in-flight downloads.
-static TASK_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Open the dialog (File ▸ Import from Immich…). A running import is stopped first; the dialog
 /// opens fresh.
 pub fn open(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
@@ -607,7 +390,6 @@ pub fn open(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
         wanted
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    let staging = std::env::temp_dir().join(format!("lc-immich-ui-{}-{}", std::process::id(), TASK_SEQ.fetch_add(1, Ordering::Relaxed)));
     let (url, key) = server_url_key(&app.session, &server).unwrap_or_default();
     app.immich_task = Some(ImmichTask {
         generation: Arc::new(AtomicU64::new(1)),
@@ -620,12 +402,7 @@ pub fn open(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
         thumbs: HashMap::new(),
         thumb_failed: HashSet::new(),
         thumb_busy: Arc::new(AtomicUsize::new(0)),
-        import: None,
         import_done: false,
-        import_ids: Vec::new(),
-        import_progress: Arc::new(ImportProgress::default()),
-        staged: Vec::new(),
-        staging,
         total: 0,
         done: 0,
         imported: 0,
@@ -640,38 +417,25 @@ pub fn open(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
     Ok(json!({"dialog": "immich"}))
 }
 
-/// Close the dialog: stop any running worker and let go of the task. Completed batches stay
-/// imported (they joined the catalog as they arrived).
+/// Close the dialog: stop any running worker and let go of the task. A running import stops
+/// with it (its uncommitted downloads are dropped with it); completed ones stay imported — they
+/// joined the catalog through `library.import` as the engine committed them.
 pub fn close(app: &mut LightcraftApp) {
-    if let Some(task) = app.immich_task.take() {
-        purge_staging(&task.staging);
+    if let Some(mut job) = app.session.immich_import.take().filter(|j| j.finished.is_none()) {
+        job.abandon();
     }
-}
-
-/// Drop everything still in a staging folder (files that never joined the library); best effort.
-fn purge_staging(staging: &std::path::Path) {
-    if let Ok(rd) = std::fs::read_dir(staging) {
-        for entry in rd.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-    let _ = std::fs::remove_dir(staging);
+    app.immich_task.take();
 }
 
 /// Cancel the import in progress: in-flight transfers stop at the next chunk, no new file is
 /// started, and the downloads that are already complete still join the library.
 pub fn cancel(app: &mut LightcraftApp) {
-    if let Some(task) = app.immich_task.as_mut() {
-        task.cancelled = true;
-        if let Some(run) = &task.import {
-            run.client.set_cancelled(true);
-        }
-    }
+    app.session.cancel_immich_import();
 }
 
 /// Start importing the selected assets (the dialog's Import button / `ui.dialog.confirm`); the
-/// dialog stays open and shows the progress. The worker starts on the next [`tick`], where there
-/// is a repaint context to hand it.
+/// dialog stays open and shows the progress. The work goes through the engine's `immich.import`
+/// in background mode — the same command the CLI and MCP run — so there is one import path.
 pub fn start_import(app: &mut LightcraftApp, d: &ImmichDialog) -> Result<Value, String> {
     let ids = d.selected_ids();
     if ids.is_empty() {
@@ -680,63 +444,51 @@ pub fn start_import(app: &mut LightcraftApp, d: &ImmichDialog) -> Result<Value, 
     if ids.len() > MAX_IMPORT_IDS {
         return Err(format!("too many photos selected ({}); select at most {MAX_IMPORT_IDS}", ids.len()));
     }
-    let (url, key) = server_url_key(&app.session, &d.server)?;
-    let client = Arc::new(Client::new(&url, &key, Limits::default()).map_err(|e| e.to_string())?);
-    let task = app.immich_task.as_mut().ok_or("the Immich dialog is not open")?;
-    if task.import.is_some() {
+    if app.session.immich_import.as_ref().is_some_and(|j| j.finished.is_none()) {
         return Err("the import is already running".into());
     }
-    if let Err(e) = std::fs::create_dir_all(&task.staging) {
-        return Err(format!("could not create the download folder: {e}"));
+    server_url_key(&app.session, &d.server)?;
+    // reset the dialog's import state, then dispatch the engine command (which needs the whole
+    // app, so the borrow above must end first)
+    {
+        let task = app.immich_task.as_mut().ok_or("the Immich dialog is not open")?;
+        task.import_done = false;
+        task.total = ids.len();
+        task.done = 0;
+        task.imported = 0;
+        task.skipped = 0;
+        task.failed.clear();
+        task.cancelled = false;
+        task.undo0 = app.session.undo.len();
     }
-    let mut import_ids: Vec<(String, String)> = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let name = d.assets.iter().find(|a| a.id == *id).map(|a| a.file_name.clone()).unwrap_or_default();
-        import_ids.push((id.clone(), name));
-    }
-    task.import = Some(ImportRun { client, started: false });
-    task.import_ids = import_ids;
-    task.import_done = false;
-    task.total = ids.len();
-    task.done = 0;
-    task.imported = 0;
-    task.skipped = 0;
-    task.failed.clear();
-    task.staged.clear();
-    task.cancelled = false;
-    task.undo0 = app.session.undo.len();
-    Ok(json!({"importing": ids.len()}))
+    app.run("immich.import", json!({ "server": d.server, "ids": ids, "background": true }))
 }
 
 /// Advance the Immich dialog (called every frame): start the jobs the dialog asked for, apply
-/// what its workers brought back, and commit finished download batches to the catalog.
+/// what its workers brought back, and take in the import run the engine drives.
 pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     // a settings-tab Test that finished while nobody was looking gets its verify here
     verify_fresh_settings_tests(app, ctx);
+    // the import runs in the engine (its worker downloads, the session commits): take in what it
+    // brought back whether or not the dialog is open
+    app.session.poll_immich_import();
     let Some(mut task) = app.immich_task.take() else { return };
     // the Cancel button asks for this; the work happens here, not in the paint pass
     if take_flag(ctx, CANCEL_FLAG) {
         task.cancelled = true;
-        if let Some(run) = &task.import {
-            run.client.set_cancelled(true);
-        }
+        app.session.cancel_immich_import();
     }
     // (re)load the albums when the dialog opened or the server changed
     if task.need_albums && !task.albums_busy && !task.server_url.is_empty() {
         task.need_albums = false;
         start_albums(&mut task, ctx);
     }
-    // the import's worker starts here, not on the button's click
-    let mut to_spawn = None;
-    if let Some(run) = task.import.as_mut().filter(|r| !r.started) {
-        run.started = true;
-        to_spawn = Some((run.client.clone(), std::mem::take(&mut task.import_ids)));
-    }
-    if let Some((client, jobs)) = to_spawn {
-        let (tx, staging, progress) = (task.tx.clone(), task.staging.clone(), task.import_progress.clone());
-        if let Err(e) = spawn_import(tx, client, staging, jobs, progress, ctx) {
-            task.import = None;
-            set_dialog_lines(app, Some(e), None);
+    // reflect the engine's import job in the dialog, and close it out when it ends
+    if let Some(job) = app.session.immich_import.as_ref() {
+        task.done = job.done;
+        task.cancelled = job.cancelled;
+        if let Some(finished) = job.finished.as_ref() {
+            reflect_finished(app, &mut task, ctx, finished.clone());
         }
     }
     let mut handled = 0usize;
@@ -789,50 +541,63 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
                     }
                 }
             }
-            Event::Downloaded { id, path, error } => match (path, error) {
-                (Some(path), _) => task.staged.push((id, path)),
-                (None, Some(e)) => {
-                    task.failed.push(format!("{id}: {e}"));
-                    task.done += 1;
-                }
-                (None, None) => {
-                    task.failed.push(format!("{id}: the download failed"));
-                    task.done += 1;
-                }
-            },
-            Event::ImportFinished => {
-                while !task.staged.is_empty() {
-                    commit_batch(app, &mut task);
-                }
-                let imported = task.imported;
-                finish_import(app, &mut task);
-                // whatever is left never made it into the library: drop it with the run
-                purge_staging(&task.staging);
-                if imported > 0 {
-                    let plural = if imported == 1 { "" } else { "s" };
-                    app.toast(ctx, crate::i18n::tr_format!("Added {} photo{} from Immich.", imported, plural));
-                }
-            }
-        }
-        while task.staged.len() >= COMMIT_BATCH {
-            commit_batch(app, &mut task);
         }
         if handled >= 64 {
             ctx.request_repaint();
             break;
         }
     }
-    if task.busy() {
+    // the import job repaints itself while it moves (like the search and album workers do)
+    if task.busy() || app.session.immich_import.as_ref().is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(80));
     }
     app.immich_task = Some(task);
+}
+
+/// The engine finished the import (or gave up): fold its result into the dialog's summary, and
+/// merge the undo steps when photos joined.
+fn reflect_finished(app: &mut LightcraftApp, task: &mut ImmichTask, ctx: &egui::Context, finished: Value) {
+    if task.import_done {
+        return;
+    }
+    task.import_done = true;
+    task.done = task.total;
+    if let Some(report) = finished.get("report") {
+        let len = |k: &str| report[k].as_array().map_or(0, Vec::len);
+        task.imported += len("imported");
+        task.skipped += len("duplicates");
+        for entry in report["failed"].as_array().into_iter().flatten() {
+            // the report's `failed` is (path, reason) pairs: the file name and the library's
+            // own reason ("Heif files are not supported yet"), never a generic stand-in
+            let (path, reason) = entry
+                .as_array()
+                .map(|a| (a.first().and_then(Value::as_str).unwrap_or(""), a.get(1).and_then(Value::as_str).unwrap_or("import failed")))
+                .unwrap_or(("", "import failed"));
+            let name = path.rsplit('/').next().unwrap_or(path);
+            task.failed.push(format!("{name}: {reason}"));
+        }
+    }
+    // the fetch failures: the server's own words, per asset
+    for f in finished.get("failed").and_then(Value::as_array).into_iter().flatten() {
+        let id = f.get("id").and_then(Value::as_str).unwrap_or("");
+        let error = f.get("error").and_then(Value::as_str).unwrap_or("the download failed");
+        task.failed.push(format!("{id}: {error}"));
+    }
+    if task.imported > 0 {
+        let plural = if task.imported == 1 { "" } else { "s" };
+        let steps = app.session.undo.len().saturating_sub(task.undo0);
+        app.session.merge_undo(steps, &crate::i18n::tr_format!("Add {} Photo{}", task.imported, plural));
+        app.toast(ctx, crate::i18n::tr_format!("Added {} photo{} from Immich.", task.imported, plural));
+    } else if let Some(e) = finished.get("error") {
+        set_dialog_lines(app, Some(e.as_str().unwrap_or("the import failed").to_string()), None);
+    }
 }
 
 /// The dialog body: server / album / filters, the paged asset grid with selectable thumbnails,
 /// and the footer. While importing it shows the progress instead.
 pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImmichDialog) {
     let t = Tokens::get(ui.ctx());
-    let importing = app.immich_task.as_ref().is_some_and(|x| x.import.is_some());
+    let importing = app.session.immich_import.as_ref().is_some_and(|j| j.finished.is_none());
     let finished = app.immich_task.as_ref().is_some_and(|x| x.import_done);
     if importing || finished {
         import_progress(app, ui);
@@ -1044,9 +809,20 @@ const CANCEL_FLAG: &str = "immich-cancel-requested";
 fn import_progress(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(task) = &app.immich_task else { return };
+    // the engine's job is the live progress: the current file, and how much of it has arrived
+    let (file_frac, file_line) = app.session.immich_import.as_ref().map_or((0.0, None), |j| {
+        let line = if j.current_file.is_empty() {
+            None
+        } else if j.file_total > 0 {
+            Some(format!("{} — {:.1} of {:.1} MB", j.current_file, j.file_done as f64 / 1e6, j.file_total as f64 / 1e6))
+        } else {
+            Some(format!("{} — {:.1} MB", j.current_file, j.file_done as f64 / 1e6))
+        };
+        (j.file_fraction(), line)
+    });
     // photos finished, plus the fraction of the one downloading now — the bar moves inside a
     // single photo, which is the whole point when there is only one
-    let frac = ((task.done as f32) + if task.import_done { 0.0 } else { task.import_progress.file_fraction() }) / task.total.max(1) as f32;
+    let frac = ((task.done as f32) + if task.import_done { 0.0 } else { file_frac }) / task.total.max(1) as f32;
     let head: String = if task.import_done {
         crate::i18n::tr("Done.").to_string()
     } else if task.cancelled {
@@ -1059,7 +835,7 @@ fn import_progress(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     if !task.import_done {
         let r = ui.add(egui::ProgressBar::new(frac).desired_width(420.0));
         register(ui.ctx(), "bar:immichProgress", r.rect);
-        if let Some(line) = task.import_progress.line() {
+        if let Some(line) = file_line {
             let r = ui.label(egui::RichText::new(line).color(t.text_dim).small());
             register(ui.ctx(), "label:immichProgressFile", r.rect);
         }
@@ -1414,22 +1190,6 @@ mod tests {
         // out of range is ignored
         d.click(99, false);
         assert_eq!(d.checked, [false, true, false, false, false, true]);
-    }
-
-    #[test]
-    fn staged_names_stay_safe_and_unique() {
-        let dir = std::env::temp_dir().join(format!("lc-immich-ui-names-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(safe_file_name("../../etc/pa:sswd.jpg", "id1"), "pa_sswd.jpg", "the directory is dropped, not flattened");
-        assert_eq!(safe_file_name("", "id123456"), "immich-id123456");
-        let a = staged_path(&dir, "x.jpg", "id1");
-        std::fs::File::create(&a).unwrap(); // the worker reserves the name before the next lookup
-        let b = staged_path(&dir, "x.jpg", "id2");
-        assert_eq!(a.file_name().unwrap().to_string_lossy(), "x.jpg");
-        assert_eq!(b.file_name().unwrap().to_string_lossy(), "x-1.jpg");
-        // an extension that is not one stays in the stem
-        assert_eq!(staged_path(&dir, "weird.nope.nope", "id3").file_name().unwrap().to_string_lossy(), "weird.nope.nope");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
