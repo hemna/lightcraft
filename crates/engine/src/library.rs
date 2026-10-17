@@ -788,43 +788,71 @@ impl Session {
         crate::cmd::immich::save(self)
     }
 
-    /// Take in what the background Immich import's worker brought back, and — when it is done —
-    /// join the staged files through the same `library.import` the synchronous path uses (one
-    /// undo step). Cheap when nothing has moved; call it every frame while the dialog is open.
+    /// Take in what the background Immich import's workers brought back: the engine's worker
+    /// downloads, and — once the downloads are in — a second worker readies them (probing,
+    /// hashing, copying), the same split the app's own importer uses, so no frame waits on a
+    /// disk. When the batch comes back, this session joins it through the same `library.import`
+    /// the synchronous path uses (one undo step) — into the library the run started in, never
+    /// one opened after it. Cheap when nothing has moved; call it every frame while the dialog
+    /// is open.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn poll_immich_import(&mut self) {
-        let done = self.immich_import.as_mut().and_then(crate::cmd::immich::ImmichImportJob::poll);
-        let Some((paths, failed)) = done else {
-            return;
-        };
-        let Some(job) = self.immich_import.as_ref() else {
-            return;
-        };
-        let (mode, staging) = (job.mode().to_string(), job.staging().to_path_buf());
-        let finished = if paths.is_empty() {
-            let _ = std::fs::remove_dir(&staging);
-            serde_json::json!({ "failed": failed, "error": "nothing could be downloaded" })
-        } else {
-            let params = serde_json::json!({ "paths": paths, "mode": mode });
-            match self.execute("library.import", &params) {
-                Ok(report) => {
-                    if mode == "copy" {
-                        // the bytes are in the library now; the staged copies have no further use
-                        for path in &paths {
-                            if let Err(e) = std::fs::remove_file(path) {
-                                log::warn!("immich: staging cleanup: {path}: {e}");
-                            }
-                        }
-                        let _ = std::fs::remove_dir(&staging);
-                    }
-                    serde_json::json!({ "report": report, "failed": failed })
-                }
-                Err(e) => serde_json::json!({ "failed": failed, "error": e.to_string() }),
+        let Some(mut job) = self.immich_import.take() else { return };
+        if let Some(paths) = job.poll() {
+            if job.library() != self.library_generation() {
+                // photo ids belong to one library: the run cannot join one opened after it
+                let _ = std::fs::remove_dir_all(job.staging());
+                job.finish(serde_json::json!({
+                    "failed": job.failed.clone(),
+                    "error": "the library was switched while the import ran; the downloads were dropped"
+                }));
+            } else if paths.is_empty() {
+                let _ = std::fs::remove_dir(job.staging());
+                job.finish(serde_json::json!({ "failed": job.failed.clone(), "error": "nothing could be downloaded" }));
+            } else {
+                job.start_commit(self, paths);
+            }
+        }
+        if let Some(msg) = job.take_commit() {
+            self.finish_immich_commit(&mut job, msg);
+        }
+        self.immich_import = Some(job);
+    }
+
+    /// Commit what the commit worker readied — the catalog half of the import, the same steps
+    /// `library.import` takes after its own prepare: the album joins, the whole import is one
+    /// undo step, and the first imported photo becomes the selection.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_immich_commit(&mut self, job: &mut crate::cmd::immich::ImmichImportJob, msg: crate::cmd::immich::CommitMsg) {
+        let batch = match msg {
+            crate::cmd::immich::CommitMsg::Prepared { batch, cache } => {
+                // probes the worker read that this import didn't use stay for a later one
+                self.import_probes.extend(cache);
+                batch
+            }
+            crate::cmd::immich::CommitMsg::Failed(e) => {
+                job.finish(serde_json::json!({ "failed": job.failed.clone(), "error": e }));
+                return;
             }
         };
-        if let Some(job) = self.immich_import.as_mut() {
-            job.finished = Some(finished);
-        }
+        let (opts, now, album, album_name) = job.commit_parts();
+        let undo0 = self.undo.len();
+        let report = self.execute_fn("library.import", |s| {
+            let report = crate::import::commit_prepared(s, &opts, &now, batch)?;
+            let report = crate::cmd::library::import_batch_done(s, report, album, album_name.as_deref())?;
+            crate::cmd::library::import_finished(s, undo0, report)
+        });
+        let finished = match report {
+            Ok(report) => {
+                if job.mode() == "copy" {
+                    // the bytes are in the library now; the staged copies have no further use
+                    let _ = std::fs::remove_dir_all(job.staging());
+                }
+                serde_json::json!({ "report": report, "failed": job.failed.clone() })
+            }
+            Err(e) => serde_json::json!({ "failed": job.failed.clone(), "error": e.to_string() }),
+        };
+        job.finish(finished);
     }
 
     /// Stop a running background Immich import (the dialog's Cancel): in-flight transfers stop at

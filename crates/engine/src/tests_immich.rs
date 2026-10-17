@@ -300,6 +300,66 @@ fn a_background_import_registers_an_activity_row_and_releases_it() {
     let _ = std::fs::remove_dir_all(&lib);
 }
 
+/// Poll a background import until it lands, then hand back its `finished` value.
+fn wait_for_import(s: &mut Session) -> Value {
+    for _ in 0..1000 {
+        s.poll_immich_import();
+        if let Some(finished) = s.immich_import.as_ref().and_then(|j| j.finished.clone()) {
+            return finished;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the import never finished");
+}
+
+#[test]
+fn a_background_import_refuses_to_join_a_library_switched_under_it() {
+    // photo ids belong to one library: a run started in library A must not commit into library
+    // B, however the switch happened (the UI refuses; the engine makes sure on its own)
+    let lib = temp_dir("impswitch");
+    let lib2 = temp_dir("impswitch2");
+    let (base, _seen, h) =
+        start(vec![reply_json(200, r#"{"id":"a1","checksum":"c1","originalFileName":"SWITCH_ME_1.JPG"}"#), reply_bytes(200, "image/png", png(7))]);
+    let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
+    s.open_library(&lib, false).unwrap();
+    add_server(&mut s, &base);
+    let r = s.execute("immich.import", &json!({"server": "Home", "ids": ["a1"], "background": true})).unwrap();
+    assert_eq!(r["importing"], 1, "{r}");
+    // switch before polling the run in: the download may even be done by then — the run still
+    // cannot commit
+    s.open_library(&lib2, false).unwrap();
+    let finished = wait_for_import(&mut s);
+    assert!(finished["error"].as_str().is_some_and(|e| e.contains("the library was switched")), "{finished}");
+    assert_eq!(s.catalog.len(), 0, "nothing joined the second library");
+    h.join().unwrap();
+    let _ = std::fs::remove_dir_all(&lib);
+    let _ = std::fs::remove_dir_all(&lib2);
+}
+
+#[test]
+fn a_background_import_joins_the_album_it_was_started_with() {
+    let lib = temp_dir("impalbum");
+    let (base, _seen, h) =
+        start(vec![reply_json(200, r#"{"id":"a1","checksum":"c1","originalFileName":"ALBUM_ME_1.JPG"}"#), reply_bytes(200, "image/png", png(8))]);
+    let mut s = Session::new().with_fs();
+    s.immich_store = Some(lib.join("immich.json"));
+    s.open_library(&lib, false).unwrap();
+    add_server(&mut s, &base);
+    let album = s.execute("album.create", &json!({"name": "Trip"})).unwrap();
+    let album = album["id"].as_u64().unwrap();
+    // a bad album id fails before anything downloads
+    let e = s.execute("immich.import", &json!({"server": "Home", "ids": ["a1"], "background": true, "album": album + 1000})).unwrap_err().to_string();
+    assert!(e.contains("album must be a regular album"), "{e}");
+    let r = s.execute("immich.import", &json!({"server": "Home", "ids": ["a1"], "background": true, "album": album})).unwrap();
+    assert_eq!(r["importing"], 1, "{r}");
+    let finished = wait_for_import(&mut s);
+    assert_eq!(finished["report"]["album"].as_u64(), Some(album), "{finished}");
+    assert_eq!(finished["report"]["imported"].as_array().map(Vec::len), Some(1), "{finished}");
+    h.join().unwrap();
+    let _ = std::fs::remove_dir_all(&lib);
+}
+
 #[test]
 fn import_staging_is_a_fresh_private_folder_per_run() {
     // `add` keeps the staged files (and their folder) in place, so the folder is inspectable

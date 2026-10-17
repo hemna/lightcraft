@@ -116,11 +116,12 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// One background `immich.import` run (the dialog's path). The engine's own worker thread does
-/// the lookups and the downloads; the session thread takes the progress in and commits the
-/// catalog through the same `library.import` the synchronous path uses — one undo step for the
-/// whole import. The UI reads the public fields every frame; the CLI and MCP never see this,
-/// they wait on the command.
+/// One background `immich.import` run (the dialog's path). The engine's own worker threads do
+/// the lookups, the downloads and the file-system half of the import (probing, hashing,
+/// copying — the same split the app's own importer uses, so no frame waits on a disk); the
+/// session thread commits the catalog through the same `library.import` the synchronous path
+/// uses — one undo step for the whole import, into the library the run started in. The UI reads
+/// the public fields every frame; the CLI and MCP never see this, they wait on the command.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct ImmichImportJob {
     /// The ids being imported.
@@ -142,9 +143,42 @@ pub struct ImmichImportJob {
     client: std::sync::Arc<lightcraft_immich::Client>,
     staging: std::path::PathBuf,
     mode: String,
+    /// The album the run joins when it commits (`immich.import`'s `album` / `albumName`, checked
+    /// when the run starts so a bad id fails before anything downloads).
+    album: Option<u64>,
+    album_name: Option<String>,
+    /// The library generation when the run started: photo ids are per library, so the completion
+    /// refuses to join a library opened after it.
+    library: u64,
+    /// The commit half once the downloads are in: a worker readies the files, the session commits
+    /// what comes back.
+    commit: Option<CommitPhase>,
     /// The activity-stack row for this run (docs/background-tasks.md). Held for exactly as long
-    /// as the job runs; `None` once it ended (the row is gone).
+    /// as the job runs — through the commit, until `finished` is set (then the row is gone).
     activity: Option<crate::activity::TaskGuard>,
+}
+
+/// The commit half of a background run (see [`ImmichImportJob::commit`]): what the session waits
+/// on, and what it needs to commit the batch the worker readied.
+#[cfg(not(target_arch = "wasm32"))]
+struct CommitPhase {
+    rx: std::sync::mpsc::Receiver<CommitMsg>,
+    /// The options (and starting time — [`crate::import::commit_prepared`] wants the original)
+    /// the commit runs with, kept here because the `ImportJob` they came from moves to the worker.
+    opts: crate::import::ImportOptions,
+    now: String,
+    /// Files the worker has found and handled so far, for the activity row while it prepares.
+    total: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// What the commit worker reports back: the readied files (with the probes a later import could
+/// reuse), or the failure when it died (a panic in the file-system half is an error, never a
+/// crash).
+#[cfg(not(target_arch = "wasm32"))]
+pub enum CommitMsg {
+    Prepared { batch: crate::import::Prepared, cache: std::collections::HashMap<String, crate::media::ProbeInfo> },
+    Failed(String),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -192,42 +226,123 @@ impl ImmichImportJob {
         &self.staging
     }
 
-    /// Take in what the worker brought back. Returns the run's result exactly once (when the
-    /// worker is done); the session then commits the files and stores it in `finished`.
-    pub fn poll(&mut self) -> Option<(Vec<String>, Vec<Value>)> {
-        let rx = self.rx.as_ref()?;
+    /// The library generation the run started in (photo ids are per library; the session refuses
+    /// to commit after a switch).
+    pub fn library(&self) -> u64 {
+        self.library
+    }
+
+    /// What the session needs to commit the batch the worker readied: the options the import
+    /// runs with, its timestamp, and the album the run joins.
+    pub fn commit_parts(&self) -> (crate::import::ImportOptions, String, Option<u64>, Option<String>) {
+        let phase = self.commit.as_ref().expect("the commit is running");
+        (phase.opts.clone(), phase.now.clone(), self.album, self.album_name.clone())
+    }
+
+    /// The commit worker's outcome, once it is in (the session commits the batch — the catalog
+    /// half — with [`Session::poll_immich_import`]).
+    pub fn take_commit(&mut self) -> Option<CommitMsg> {
+        self.commit.as_ref()?.rx.try_recv().ok()
+    }
+
+    /// The run's outcome is in (the session committed, or refused to): remember it and let the
+    /// activity row go.
+    pub fn finish(&mut self, value: Value) {
+        self.finished = Some(value);
+        self.commit = None;
+        self.activity = None;
+    }
+
+    /// Take in what the workers brought back. Returns the staged files exactly once (when the
+    /// download worker is done — the failures are in `failed` by then); the session then starts
+    /// the commit half and stores the run's outcome in `finished` once that lands.
+    pub fn poll(&mut self) -> Option<Vec<String>> {
         let mut done = None;
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                ImportMsg::Start { name } => {
-                    self.current_file = name;
-                    self.file_done = 0;
-                    self.file_total = 0;
-                }
-                ImportMsg::Progress { done, total } => {
-                    self.file_done = done;
-                    if total > 0 {
-                        self.file_total = total;
+        if let Some(rx) = self.rx.as_ref() {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    // the worker downloads one file at a time: a new start means the last one ended
+                    ImportMsg::Start { name } => {
+                        if !self.current_file.is_empty() {
+                            self.done += 1;
+                        }
+                        self.current_file = name;
+                        self.file_done = 0;
+                        self.file_total = 0;
+                    }
+                    ImportMsg::Progress { done, total } => {
+                        self.file_done = done;
+                        if total > 0 {
+                            self.file_total = total;
+                        }
+                    }
+                    ImportMsg::Done { paths, failed } => {
+                        self.failed = failed;
+                        done = Some(paths);
                     }
                 }
-                ImportMsg::Done { paths, failed } => done = Some((paths, failed)),
             }
         }
-        // the activity row mirrors the run: the photo count as progress, the current file as detail
+        // the activity row mirrors the run: files as progress, the current file (with its byte
+        // progress) as detail — while the commit readies them, the files it has handled
         if let Some(row) = self.activity.as_ref() {
-            row.progress(self.done as u64, self.total as u64);
-            if !self.current_file.is_empty() {
-                row.detail(&self.current_file);
+            if let Some(phase) = self.commit.as_ref() {
+                row.progress(
+                    phase.done.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    phase.total.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                );
+            } else {
+                row.progress(self.done as u64, self.total as u64);
+                if !self.current_file.is_empty() {
+                    if self.file_total > 0 {
+                        row.detail(&format!("{} · {}", self.current_file, bytes_of(self.file_done, self.file_total)));
+                    } else {
+                        row.detail(&self.current_file);
+                    }
+                }
             }
         }
         if done.is_some() {
             self.rx = None;
             self.current_file.clear();
             self.done = self.total;
-            // the run is over: the row goes away with the guard
-            self.activity = None;
+            if let Some(row) = self.activity.as_ref() {
+                row.detail("");
+            }
+            // the row stays: the commit half is still to run — `finish` lets it go
         }
         done
+    }
+
+    /// The downloads are in: set the run up to commit. [`crate::import::ImportJob::prepare`] —
+    /// probing, hashing, copying, several files at once — runs on a worker of its own (the app's
+    /// own importer uses the same split, so no frame waits on a disk); the session commits the
+    /// batch that comes back as one `library.import` undo step.
+    pub fn start_commit(&mut self, s: &mut Session, paths: Vec<String>) {
+        let mode = if self.mode == "add" { crate::import::ImportMode::Add } else { crate::import::ImportMode::Copy };
+        let job = match crate::import::ImportJob::new(s, crate::import::ImportOptions { mode, ..Default::default() }) {
+            Ok(job) => job,
+            Err(e) => {
+                self.finish(json!({ "failed": self.failed.clone(), "error": e.to_string() }));
+                return;
+            }
+        };
+        let (total, done) = (job.total.clone(), job.done.clone());
+        let (opts, now) = (job.opts.clone(), job.now().to_string());
+        let cancel = self.client.cancel_flag();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("lc-immich-commit".into())
+            .spawn({
+                let cancel = cancel.clone();
+                move || run_commit_worker(tx, job, paths, cancel)
+            })
+            .map_err(|e| format!("immich.import: could not start the commit worker: {e}"));
+        match worker {
+            // a dead worker simply never answers; the catch in `run_commit_worker` always does
+            Ok(_handle) => self.commit = Some(CommitPhase { rx, opts, now, total, done }),
+            Err(e) => self.finish(json!({ "failed": self.failed.clone(), "error": e })),
+        }
     }
 }
 
@@ -586,13 +701,23 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let srv = server_of(s, p, CID)?;
     let client = std::sync::Arc::new(lightcraft_immich::Client::new(&srv.url, &srv.api_key, Default::default()).map_err(net(CID))?);
     let background = p.get("background").and_then(Value::as_bool).unwrap_or(false);
+    // the album the run joins at the end, checked up front so a bad id fails before anything
+    // downloads (`library.import` checks it too, but the background completion would only find
+    // out after the whole run)
+    let album = p.get("album").and_then(Value::as_u64);
+    if let Some(a) = album
+        && s.catalog.album(lightcraft_catalog::AlbumId(a)).is_none_or(|al| al.folder || al.is_smart())
+    {
+        return Err(bad(CID, "album must be a regular album"));
+    }
+    let album_name = str_param(p, "albumName").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
     if background {
         if s.immich_import.as_ref().is_some_and(|job| job.finished.is_none()) {
             return Err(EngineError::Other("immich.import: an import is already running".to_string()));
         }
         // one activity-stack row for the whole run (docs/background-tasks.md): the row's ✕,
         // `activity.cancel` and the dialog's Cancel all set the client's cancel flag, which the
-        // worker checks between files and mid-transfer
+        // workers check between files and mid-transfer
         let activity = s.activity.start("import", "Importing from Immich", crate::activity::Cancel::Flag(client.cancel_flag()));
         activity.progress(0, ids.len() as u64);
         let staging = staging_dir()?;
@@ -619,6 +744,10 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
             client,
             staging,
             mode: mode.to_string(),
+            album,
+            album_name,
+            library: s.library_generation(),
+            commit: None,
             activity: Some(activity),
         });
         let _ = worker; // a dead worker simply never answers; its sends fail and the job ends empty
@@ -691,6 +820,48 @@ fn run_download_worker(
     let _ = tx.send(ImportMsg::Done { paths, failed });
 }
 
+/// The commit worker: ready the staged files — expand, probe, hash, copy/place, the file-system
+/// half any import runs ([`crate::import::ImportJob::prepare_files`]) — and hand the batch back.
+/// The client's cancel flag stops it between files, like the download worker's. If the session
+/// dropped the run meanwhile, what a Move placed is taken back (copies stay, like the ones of a
+/// failed commit).
+#[cfg(not(target_arch = "wasm32"))]
+fn run_commit_worker(
+    tx: std::sync::mpsc::Sender<CommitMsg>,
+    mut job: crate::import::ImportJob,
+    paths: Vec<String>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    // one batch: the commit is one undo step, like the synchronous path's
+    let r = crate::guard::catch("immich import", move || {
+        let files = job.expand(&paths);
+        let batch = job.prepare_files(files, &cancel);
+        (batch, std::mem::take(&mut job.cache))
+    });
+    match r {
+        Ok((batch, cache)) => match tx.send(CommitMsg::Prepared { batch, cache }) {
+            Ok(()) => {}
+            // the session dropped the run meanwhile: take back what a Move placed (copies stay)
+            Err(unsent) => {
+                if let CommitMsg::Prepared { batch, .. } = unsent.0 {
+                    batch.rollback();
+                }
+            }
+        },
+        Err(e) => {
+            let _ = tx.send(CommitMsg::Failed(e));
+        }
+    }
+}
+
+/// "50 of 100 KB" / "12.3 of 45.6 MB" — the current file's byte progress, for the activity row's
+/// detail line.
+#[cfg(not(target_arch = "wasm32"))]
+fn bytes_of(done: u64, total: u64) -> String {
+    let one = |n: u64| -> String { if n >= 1024 * 1024 { format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)) } else { format!("{} KB", n / 1024) } };
+    format!("{} of {}", one(done), one(total))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     let mut v = vec![
         cmd!(
@@ -746,7 +917,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Import from Immich",
             [],
             None,
-            "{server?, ids: [assetId...], mode? (\"copy\" default, into the library; \"add\" keeps the files in the staging folder), album?|albumName?, background? (true = run on the engine's worker and return at once, for the UI; poll Session::immich_import, then it is {report, failed})} — download the assets and run the ordinary import over them (dedupe, undo) → {report, failed: [{id, error}]} (synchronous: {importing} once started in background mode)",
+            "{server?, ids: [assetId...], mode? (\"copy\" default, into the library; \"add\" keeps the files in the staging folder), album?|albumName? (a regular album's id — checked when the run starts; the photos join it), background? (true = run on the engine's worker and return at once, for the UI; poll Session::immich_import, then it is {report, failed}; the run joins the library it started in — a library switched under it ends it with {failed, error})} — download the assets and run the ordinary import over them (dedupe, undo) → {report, failed: [{id, error}]} (synchronous: {importing} once started in background mode)",
             always,
             import
         ));
@@ -773,5 +944,48 @@ mod tests {
         // an extension that is not one stays in the stem
         assert_eq!(staged_path(&dir, "weird.nope.nope").file_name().unwrap().to_string_lossy(), "weird.nope.nope");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poll_counts_finished_files_and_shares_the_current_files_bytes() {
+        // the activity row has to move while the run goes: one finished file per Start (the
+        // worker downloads one file at a time), and the current file's bytes in the detail
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client = std::sync::Arc::new(lightcraft_immich::Client::new("http://127.0.0.1:1", "k", Default::default()).unwrap());
+        let activity = crate::activity::Activity::default();
+        let guard = activity.start("import", "Importing from Immich", crate::activity::Cancel::Flag(client.cancel_flag()));
+        let mut job = ImmichImportJob {
+            total: 2,
+            done: 0,
+            current_file: String::new(),
+            file_done: 0,
+            file_total: 0,
+            failed: Vec::new(),
+            finished: None,
+            cancelled: false,
+            rx: Some(rx),
+            client,
+            staging: std::path::PathBuf::from("/nonexistent"),
+            mode: "copy".into(),
+            album: None,
+            album_name: None,
+            library: 0,
+            commit: None,
+            activity: Some(guard),
+        };
+        tx.send(ImportMsg::Start { name: "a.jpg".into() }).unwrap();
+        tx.send(ImportMsg::Progress { done: 50 * 1024, total: 100 * 1024 }).unwrap();
+        assert!(job.poll().is_none());
+        let row = &activity.list()[0];
+        assert_eq!((row.done, row.total), (0, 2), "the first file is still in flight");
+        assert_eq!(row.detail, "a.jpg · 50 KB of 100 KB", "the row shows the current file and its bytes");
+        tx.send(ImportMsg::Start { name: "b.jpg".into() }).unwrap();
+        assert!(job.poll().is_none());
+        assert_eq!(job.done, 1, "the first file ended when the next one started");
+        assert_eq!(activity.list()[0].done, 1, "the row's count moved");
+        tx.send(ImportMsg::Done { paths: vec!["/x/a.jpg".into(), "/x/b.jpg".into()], failed: vec![] }).unwrap();
+        assert_eq!(job.poll().expect("the downloads ended"), vec!["/x/a.jpg".to_string(), "/x/b.jpg".to_string()]);
+        assert_eq!(job.done, 2, "the run counts every file at the end");
+        assert_eq!(activity.list()[0].detail, "", "no stale file name while the commit readies them");
     }
 }

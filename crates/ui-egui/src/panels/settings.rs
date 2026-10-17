@@ -75,7 +75,7 @@ pub(crate) fn heading(ui: &mut egui::Ui, t: &Tokens, text: &str) {
     ui.label(RichText::new(crate::i18n::tr(text)).font(t.semibold(12.5)).color(t.text));
 }
 
-pub(super) fn row<R>(ui: &mut egui::Ui, t: &Tokens, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub(crate) fn row<R>(ui: &mut egui::Ui, t: &Tokens, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(egui::vec2(LABEL_W, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_width(LABEL_W);
@@ -1065,13 +1065,19 @@ fn theme_preview(ui: &mut egui::Ui, kind: crate::theme::ThemeKind, width: f32) {
 // ------------------------------------------------------------------------------- Open Library…
 
 /// Switching libraries is refused while an import (or the folder scan before one) is running: its
-/// remaining batches would be committed into the new library (issue #1509).
+/// remaining batches would be committed into the new library (issue #1509). The background Immich
+/// import is in the same boat — and the engine drops its downloads with an error if a switch
+/// happens anyway (say, from the CLI).
 pub(crate) fn can_switch_library(app: &LightcraftApp) -> Result<(), String> {
     if crate::lightroom_import::is_running(app) {
         return Err("wait for Lightroom catalog import to finish before switching libraries".into());
     }
     if app.import.is_some() || app.scan.is_some() {
         return Err("wait for the import to finish before switching libraries".into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if app.session.immich_import.as_ref().is_some_and(|job| job.finished.is_none()) {
+        return Err("wait for the Immich import to finish before switching libraries".into());
     }
     Ok(())
 }
